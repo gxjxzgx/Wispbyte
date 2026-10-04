@@ -25,6 +25,11 @@ WORKSPACE = os.environ.get("GITHUB_WORKSPACE", str(Path.cwd()))
 OUTPUT_DIR = Path(WORKSPACE) / "output/screenshots"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# 上次重启记录文件（配合 Actions cache 可跨运行持久化）
+LAST_RESTART_FILE = Path(WORKSPACE) / "output/last_restarts.json"
+# 强制重启间隔（天）
+FORCE_RESTART_DAYS = 5
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -770,91 +775,12 @@ def get_servers(sb) -> List[str]:
     return []
 
 
-# ====================== 重启服务器（完整流程）======================
-def restart_server(sb, identifier: str) -> bool:
+def get_server_status(sb, identifier: str) -> Optional[str]:
     """
-    完整重启流程：
-    1. 导航到控制台
-    2. 点击 Start/Restart 按钮
-    3. 处理广告流程（reward video / alert / adblocker）
-    4. 确保回到控制台页面
-    5. 处理 CF Turnstile 验证弹窗
-    6. 轮询服务器状态
+    通过 API 获取指定服务器的当前状态。
+    返回 current_state 字符串（如 'running', 'offline', 'starting' 等），
+    失败时返回 None。
     """
-    console_url = CONSOLE_URL_TEMPLATE.format(identifier=identifier)
-    safe_id = mask_server_id(identifier)
-    log(f"{'─'*40}")
-    log(f"重启服务器: {safe_id}")
-    log(f"{'─'*40}")
-
-    # ── Step 1: 导航到控制台 ──
-    log(f"导航到控制台: {safe_id}")
-    sb.get(console_url)
-    time.sleep(5)
-    block_ads_modals(sb)
-
-    # ── Step 2: 点击 Start / Restart ──
-    start_btn = None
-    for btn_sel, btn_name in [('button#start-btn', 'Start'), ('button#restart-btn', 'Restart')]:
-        try:
-            start_btn = sb.wait_for_element_visible(btn_sel, timeout=8)
-            log(f"找到 {btn_name} 按钮")
-            break
-        except Exception:
-            continue
-
-    if not start_btn:
-        log("未找到 Start/Restart 按钮", "ERROR")
-        return False
-
-    try:
-        start_btn.click()
-        log("✅ 已点击 Start/Restart 按钮")
-    except Exception:
-        try:
-            sb.execute_script("document.querySelector('#start-btn, #restart-btn').click()")
-            log("✅ 已通过 JS 点击 Start/Restart 按钮")
-        except Exception as e:
-            log(f"点击 Start/Restart 失败: {e}", "ERROR")
-            return False
-
-    # 等待页面响应
-    time.sleep(3)
-
-    # ── Step 3: 处理广告流程 ──
-    log("=== 开始处理广告流程 ===")
-    handle_reward_ad_flow(sb, identifier, console_url)
-    log("=== 广告流程处理完毕 ===")
-
-    # ── Step 4: 确保回到控制台页面 ──
-    time.sleep(2)
-    current_url = sb.get_current_url()
-    if identifier not in current_url or "reward" in current_url:
-        log(f"当前不在控制台页面（{current_url[:80]}），重新导航...")
-        sb.get(console_url)
-        time.sleep(5)
-        block_ads_modals(sb)
-    else:
-        log(f"当前在控制台页面，无需重新导航")
-        block_ads_modals(sb)
-
-    # ── Step 5: 处理 CF Turnstile 验证弹窗 ──
-    log("=== 开始处理 CF Turnstile 验证 ===")
-    cf_result = handle_restart_turnstile_modal(sb, timeout=90)
-    if not cf_result:
-        log("CF Turnstile 验证失败", "WARN")
-        # 不直接返回 False，继续尝试轮询
-    else:
-        log("=== CF Turnstile 验证完成 ===")
-
-    block_ads_modals(sb)
-
-    # ── Step 6: 轮询服务器状态 ──
-    log(f"开始轮询服务器状态（最长 60 秒）: {safe_id}")
-    poll_timeout = 60
-    poll_interval = 5
-    start_poll = time.time()
-
     status_script = f'''
         var callback = arguments[arguments.length - 1];
         var serverId = {json.dumps(identifier)};
@@ -864,19 +790,204 @@ def restart_server(sb, identifier: str) -> bool:
         }})
         .then(function(res) {{ return res.json(); }})
         .then(function(data) {{
-            var server = data.servers.find(function(s) {{
+            var server = (data.servers || []).find(function(s) {{
                 return s.identifier === serverId;
             }});
-            callback(server ? server.current_state : null);
+            callback(server ? (server.current_state || null) : null);
         }})
         .catch(function() {{ callback(null); }});
     '''
+    try:
+        status = sb.execute_async_script(status_script)
+        return str(status).strip() if status else None
+    except Exception as e:
+        log(f"获取服务器状态异常: {e}", "WARN")
+        return None
+
+
+def is_server_running(status: Optional[str]) -> bool:
+    """判断状态是否表示服务器已开机运行。"""
+    if not status:
+        return False
+    return 'running' in status.lower()
+
+
+def load_last_restarts() -> dict:
+    """加载各服务器上次成功操作的时间戳。"""
+    try:
+        if LAST_RESTART_FILE.exists():
+            with open(LAST_RESTART_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        log(f"读取上次重启记录失败: {e}", "WARN")
+    return {}
+
+
+def save_last_restart(identifier: str):
+    """记录服务器本次成功操作时间。"""
+    try:
+        data = load_last_restarts()
+        data[identifier] = datetime.now().isoformat(timespec="seconds")
+        LAST_RESTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(LAST_RESTART_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        log(f"已记录服务器 {mask_server_id(identifier)} 操作时间")
+    except Exception as e:
+        log(f"保存重启记录失败: {e}", "WARN")
+
+
+def should_force_restart(identifier: str) -> bool:
+    """
+    判断是否已超过强制重启间隔（默认 5 天）。
+    无记录时视为需要强制重启。
+    """
+    data = load_last_restarts()
+    last_str = data.get(identifier)
+    if not last_str:
+        log(f"服务器 {mask_server_id(identifier)} 无历史重启记录，需要执行操作")
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last_str)
+        days_passed = (datetime.now() - last_dt).total_seconds() / 86400
+        if days_passed >= FORCE_RESTART_DAYS:
+            log(f"服务器 {mask_server_id(identifier)} 距上次操作已 {days_passed:.1f} 天，达到 {FORCE_RESTART_DAYS} 天强制重启条件")
+            return True
+        log(f"服务器 {mask_server_id(identifier)} 距上次操作仅 {days_passed:.1f} 天，未达强制重启间隔")
+        return False
+    except Exception as e:
+        log(f"解析上次重启时间失败: {e}，将强制执行", "WARN")
+        return True
+
+
+# ====================== 重启 / 启动服务器（完整流程）======================
+def restart_server(sb, identifier: str) -> bool:
+    """
+    智能启动/重启流程：
+    1. 导航到控制台
+    2. 检查当前状态：
+       - 状态正常（running）且未满 5 天 → 跳过
+       - 状态正常且已满 5 天 → 强制重启
+       - 状态异常 → 开机（Start）或重启（Restart）
+    3. 处理广告流程
+    4. 确保回到控制台页面
+    5. 处理 CF Turnstile 验证弹窗
+    6. 轮询直至状态变为 running，并记录操作时间
+    """
+    console_url = CONSOLE_URL_TEMPLATE.format(identifier=identifier)
+    safe_id = mask_server_id(identifier)
+    log(f"{'─'*40}")
+    log(f"处理服务器: {safe_id}")
+    log(f"{'─'*40}")
+
+    # ── Step 1: 导航到控制台 ──
+    log(f"导航到控制台: {safe_id}")
+    sb.get(console_url)
+    time.sleep(4)
+    block_ads_modals(sb)
+
+    # ── Step 2: 检查状态并决定是否操作 ──
+    current_status = get_server_status(sb, identifier)
+    log(f"当前服务器状态: {current_status or '未知'}")
+
+    running = is_server_running(current_status)
+    force = should_force_restart(identifier)
+
+    if running and not force:
+        log(f"✅ 服务器 {safe_id} 状态正常，且未到 {FORCE_RESTART_DAYS} 天强制重启周期，跳过")
+        return True  # 视为成功（无需操作）
+
+    if running and force:
+        action = "Restart"
+        preferred_selectors = [
+            ('button#restart-btn', 'Restart'),
+            ('button#start-btn', 'Start'),
+        ]
+        log(f"服务器状态正常，但已到 {FORCE_RESTART_DAYS} 天强制重启周期，将执行重启")
+    else:
+        # 状态异常（offline / stopped / starting / unknown 等）
+        action = "Start"
+        preferred_selectors = [
+            ('button#start-btn', 'Start'),
+            ('button#restart-btn', 'Restart'),
+        ]
+        log("服务器状态异常，将执行开机/重启操作")
+
+    # ── Step 3: 点击对应按钮 ──
+    action_btn = None
+    used_name = action
+    for btn_sel, btn_name in preferred_selectors:
+        try:
+            action_btn = sb.wait_for_element_visible(btn_sel, timeout=8)
+            used_name = btn_name
+            log(f"找到 {btn_name} 按钮")
+            break
+        except Exception:
+            continue
+
+    if not action_btn:
+        log("未找到 Start 或 Restart 按钮", "ERROR")
+        return False
+
+    try:
+        action_btn.click()
+        log(f"✅ 已点击 {used_name} 按钮")
+    except Exception:
+        try:
+            js_selector = "#restart-btn" if action == "Restart" else "#start-btn"
+            sb.execute_script(
+                f"var b = document.querySelector('{js_selector}') || "
+                f"document.querySelector('#start-btn, #restart-btn');"
+                f"if (b) b.click();"
+            )
+            log(f"✅ 已通过 JS 点击 {used_name} 按钮")
+        except Exception as e:
+            log(f"点击 {used_name} 失败: {e}", "ERROR")
+            return False
+
+    # 等待页面响应
+    time.sleep(3)
+
+    # ── Step 4: 处理广告流程 ──
+    log("=== 开始处理广告流程 ===")
+    handle_reward_ad_flow(sb, identifier, console_url)
+    log("=== 广告流程处理完毕 ===")
+
+    # ── Step 5: 确保回到控制台页面 ──
+    time.sleep(2)
+    current_url = sb.get_current_url()
+    if identifier not in current_url or "reward" in current_url:
+        log(f"当前不在控制台页面（{current_url[:80]}），重新导航...")
+        sb.get(console_url)
+        time.sleep(4)
+        block_ads_modals(sb)
+    else:
+        log("当前在控制台页面，无需重新导航")
+        block_ads_modals(sb)
+
+    # ── Step 6: 处理 CF Turnstile 验证弹窗 ──
+    log("=== 开始处理 CF Turnstile 验证 ===")
+    cf_result = handle_restart_turnstile_modal(sb, timeout=90)
+    if not cf_result:
+        log("CF Turnstile 验证失败", "WARN")
+    else:
+        log("=== CF Turnstile 验证完成 ===")
+
+    block_ads_modals(sb)
+
+    # ── Step 7: 轮询服务器状态 ──
+    log(f"开始轮询服务器状态（最长 60 秒）: {safe_id}")
+    poll_timeout = 60
+    poll_interval = 5
+    start_poll = time.time()
 
     while time.time() - start_poll < poll_timeout:
         try:
-            status = sb.execute_async_script(status_script)
-            if status and 'running' in str(status).lower():
-                log(f"✅ 服务器 {safe_id} 状态: {status}，重启成功！")
+            status = get_server_status(sb, identifier)
+            if is_server_running(status):
+                log(f"✅ 服务器 {safe_id} 状态: {status}，{action} 成功！")
+                save_last_restart(identifier)
                 return True
             log(f"当前状态: {status or '未知'}，{poll_interval}s 后重试...")
         except Exception as e:
@@ -885,9 +996,10 @@ def restart_server(sb, identifier: str) -> bool:
 
     # 最终检查
     try:
-        status = sb.execute_async_script(status_script)
-        if status and 'running' in str(status).lower():
+        status = get_server_status(sb, identifier)
+        if is_server_running(status):
             log(f"✅ 最终检查成功: {safe_id} 状态: {status}")
+            save_last_restart(identifier)
             return True
         log(f"❌ 轮询超时，最终状态: {status or '未知'}", "ERROR")
         return False
@@ -925,7 +1037,7 @@ def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat:
                 suffix = f"done-{si}" if len(servers) > 1 else "done"
                 screenshot = take_screenshot(sb, idx, suffix)
                 status_icon = "✅" if success else "❌"
-                status_text = "重启成功" if success else "重启失败"
+                status_text = "操作成功（或已跳过）" if success else "操作失败"
                 caption = (
                     f"{status_icon} {status_text}\n\n"
                     f"账号: {mask_email(email)}\n"
