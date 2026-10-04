@@ -643,102 +643,169 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
 
 def handle_reward_ad_flow(sb, identifier: str, console_url: str) -> bool:
     """
-    完整广告流程处理器。
-    在点击 Start 按钮后调用。
-
-    处理以下所有情况：
-      A. 跳转到 reward-video 页面 → 等待按钮 → 点击 → 等待完成
-      B. Alert 弹窗 "No ad available" → 关闭弹窗 → 继续（走CF验证）
-      C. AdBlocker 检测页 → 点击 Check again → 重新检测
-      D. 没有广告页面 → 直接返回 True（继续CF验证）
+    完整广告/验证前置流程（根据实际页面行为）：
+      1. 点击 Start 后可能跳转到 venatus 广告页（右上角有 Cancel）
+      2. 点击 Cancel 或等待后，可能出现 Alert：
+         "No ad available right now — complete a quick verification to start."
+      3. 点击 Alert 的「确定」后，进入 CF Turnstile 验证
+      4. 也可能直接出现完整广告观看流程
 
     返回 True 表示可以继续执行 CF 验证流程
     """
     safe_id = mask_server_id(identifier)
     log(f"广告流程处理开始: {safe_id}")
+    console_path = f"/servers/{identifier}/console"
 
-    # 等待页面响应（最多 15 秒）
-    ad_flow_timeout = 15
+    # 最多处理 45 秒
     start = time.time()
+    max_wait = 45
+    cancel_clicked = False
 
-    while time.time() - start < ad_flow_timeout:
-        # 优先处理 Alert 弹窗（因为 alert 会阻塞其他操作）
+    while time.time() - start < max_wait:
+        elapsed = int(time.time() - start)
+
+        # ① 优先处理 JS Alert（"No ad available..."）
         if _dismiss_alert_if_present(sb):
-            log("✅ 已处理 Alert 弹窗（无广告情况），继续CF验证")
+            log("✅ 已点击 Alert「确定」，准备进入 CF 验证")
+            time.sleep(1)
             return True
 
-        situation = _get_page_situation(sb)
-        log(f"当前页面情况: {situation}")
+        current_url = ""
+        try:
+            current_url = sb.get_current_url() or ""
+        except Exception:
+            pass
 
-        if situation == 'reward':
-            # 进入广告观看流程
-            return _execute_reward_ad_watch(sb, identifier)
+        # ② 已回到控制台 → 结束广告流程，交给 CF 处理
+        if console_path in current_url:
+            log("已回到控制台页面，结束广告流程")
+            # 再检查一次是否有 Alert
+            time.sleep(1)
+            if _dismiss_alert_if_present(sb):
+                log("✅ 回到控制台后处理了 Alert")
+            return True
 
-        elif situation == 'adblocker':
-            # 处理广告拦截器检测页
-            log("检测到广告拦截器页面")
-            _handle_adblocker_page(sb)
-            time.sleep(3)
-            # 再次检查（可能变成 reward 或 alert）
+        # ③ 在 venatus / reward 广告页 → 等待几秒后点右上角 Cancel
+        if ("venatus" in current_url or "reward-demo" in current_url or
+            "reward_demo" in current_url or "reward-video" in current_url):
+            if not cancel_clicked and elapsed >= 3:
+                log("检测到广告页，尝试点击右上角 Cancel 按钮...")
+                if _click_venatus_cancel(sb):
+                    cancel_clicked = True
+                    log("✅ 已点击 Cancel，等待页面响应...")
+                    time.sleep(3)
+                    # 点击 Cancel 后常会弹出 Alert
+                    if _dismiss_alert_if_present(sb):
+                        log("✅ Cancel 后处理了 Alert「确定」")
+                        return True
+                else:
+                    # 兜底：用通用关闭逻辑
+                    _try_close_ad_overlay(sb)
+            if elapsed % 10 == 0:
+                log(f"仍在广告页 [{elapsed}s]: {current_url[:60]}")
+            time.sleep(1)
             continue
 
-        elif situation == 'console':
-            log("当前在控制台页面，无需处理广告")
-            return True
+        # ④ 其他情况（adblocker 等）
+        situation = _get_page_situation(sb)
+        if situation == 'adblocker':
+            log("检测到广告拦截器页面")
+            _handle_adblocker_page(sb)
+            time.sleep(2)
+            continue
+
+        if situation == 'reward':
+            # 有完整广告观看按钮的情况，走原逻辑
+            log("检测到完整广告观看页，尝试处理...")
+            return _execute_reward_ad_watch(sb, identifier)
 
         time.sleep(1)
 
-    # 超时：再检查一次 alert
+    # 超时收尾
     if _dismiss_alert_if_present(sb):
-        log("✅ 超时后处理 Alert 弹窗")
+        log("✅ 超时后处理了 Alert")
         return True
-
-    log("广告流程等待超时，继续执行CF验证", "WARN")
+    log("广告流程等待超时，继续执行 CF 验证", "WARN")
     return True
+
+
+def _click_venatus_cancel(sb) -> bool:
+    """
+    专门点击 venatus 广告页右上角的 Cancel 按钮。
+    """
+    try:
+        # 优先精确匹配
+        clicked = sb.execute_script('''
+            // 1. 文本精确为 Cancel 的按钮
+            var buttons = document.querySelectorAll('button, a, [role="button"]');
+            for (var i = 0; i < buttons.length; i++) {
+                var el = buttons[i];
+                var text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                if (text === 'cancel' || text === '取消') {
+                    el.click();
+                    return true;
+                }
+            }
+            // 2. 右上角位置的按钮
+            for (var j = 0; j < buttons.length; j++) {
+                var b = buttons[j];
+                var rect = b.getBoundingClientRect();
+                var text2 = (b.innerText || b.textContent || '').trim().toLowerCase();
+                if (rect.top < 80 && rect.right > (window.innerWidth - 120) &&
+                    (text2.indexOf('cancel') !== -1 || text2.indexOf('close') !== -1 || text2 === '×')) {
+                    b.click();
+                    return true;
+                }
+            }
+            return false;
+        ''')
+        if clicked:
+            time.sleep(1)
+            return True
+    except Exception as e:
+        log(f"点击 Cancel 异常: {e}", "WARN")
+    return False
 
 
 def _execute_reward_ad_watch(sb, identifier: str) -> bool:
     """
-    在 reward-video 页面执行完整广告观看流程。
+    在 reward-video 页面执行完整广告观看流程（有真实广告可看时）。
     返回 True 表示广告流程结束（无论成功与否都应继续CF验证）
     """
     safe_id = mask_server_id(identifier)
     log(f"进入广告观看流程: {safe_id}")
 
     # 等待 Watch ad 按钮就绪
-    btn_ready = _wait_for_reward_btn_ready(sb, timeout=90)
+    btn_ready = _wait_for_reward_btn_ready(sb, timeout=60)
 
     if not btn_ready:
-        # 按钮未就绪，检查是否有 alert（No ad available）
         if _dismiss_alert_if_present(sb):
             log("✅ 广告按钮未就绪但检测到 Alert（无广告），继续CF验证")
             return True
-
-        # 检查是否 failRewardReturn 已经把页面跳回
-        current_url = sb.get_current_url()
-        if "reward-video" not in current_url:
+        current_url = sb.get_current_url() or ""
+        if "reward-video" not in current_url and "venatus" not in current_url:
             log(f"广告页面已自动跳转: {current_url[:80]}")
             return True
-
+        # 尝试点 Cancel
+        if _click_venatus_cancel(sb):
+            time.sleep(2)
+            _dismiss_alert_if_present(sb)
+            return True
         log("广告按钮未就绪，继续CF验证", "WARN")
         return True
 
-    # 在点击前再检查一次 alert
     if _dismiss_alert_if_present(sb):
         log("✅ 点击前检测到 Alert（无广告），继续CF验证")
         return True
 
-    # 点击 Watch ad 按钮
     if not _click_watch_ad_btn(sb):
-        log("广告按钮点击失败，继续CF验证", "WARN")
+        log("广告按钮点击失败，尝试 Cancel...", "WARN")
+        _click_venatus_cancel(sb)
+        _dismiss_alert_if_present(sb)
         return True
 
-    # 等待广告完成
-    _wait_for_ad_completion(sb, identifier, timeout=300)
-
-    # 广告完成后处理可能的 alert
+    _wait_for_ad_completion(sb, identifier, timeout=180)
     _dismiss_alert_if_present(sb)
-
     log(f"广告流程结束: {safe_id}")
     return True
 
