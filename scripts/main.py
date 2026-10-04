@@ -644,21 +644,40 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
 def handle_reward_ad_flow(sb, identifier: str, console_url: str) -> bool:
     """
     完整广告/验证前置流程（根据实际页面行为）：
-      1. 点击 Start 后可能跳转到 venatus 广告页（右上角有 Cancel）
-      2. 点击 Cancel 或等待后，可能出现 Alert：
+      1. 点击 Start 后会跳转到 venatus 广告页（右上角有 Cancel）
+      2. 点击 Cancel 后，可能出现 Alert：
          "No ad available right now — complete a quick verification to start."
       3. 点击 Alert 的「确定」后，进入 CF Turnstile 验证
       4. 也可能直接出现完整广告观看流程
 
+    注意：点击 Start 后不要立即判断“已在控制台”，需先等待页面跳转。
     返回 True 表示可以继续执行 CF 验证流程
     """
     safe_id = mask_server_id(identifier)
     log(f"广告流程处理开始: {safe_id}")
     console_path = f"/servers/{identifier}/console"
 
-    # 最多处理 45 秒
+    # 点击 Start 后先等页面有机会跳转（不要立刻判定已在控制台）
+    log("等待页面跳转（最多 8 秒）...")
+    navigated_away = False
+    for _ in range(8):
+        if _dismiss_alert_if_present(sb):
+            log("✅ 早期检测到 Alert「确定」")
+            return True
+        try:
+            url = sb.get_current_url() or ""
+            if ("venatus" in url or "reward" in url or "reward-video" in url or
+                "reward-demo" in url):
+                navigated_away = True
+                log(f"已跳转到广告页: {url[:70]}")
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    # 最多再处理 40 秒
     start = time.time()
-    max_wait = 45
+    max_wait = 40
     cancel_clicked = False
 
     while time.time() - start < max_wait:
@@ -676,37 +695,42 @@ def handle_reward_ad_flow(sb, identifier: str, console_url: str) -> bool:
         except Exception:
             pass
 
-        # ② 已回到控制台 → 结束广告流程，交给 CF 处理
-        if console_path in current_url:
-            log("已回到控制台页面，结束广告流程")
-            # 再检查一次是否有 Alert
-            time.sleep(1)
-            if _dismiss_alert_if_present(sb):
-                log("✅ 回到控制台后处理了 Alert")
-            return True
-
-        # ③ 在 venatus / reward 广告页 → 等待几秒后点右上角 Cancel
+        # ② 在 venatus / reward 广告页 → 点右上角 Cancel（不要导航回控制台）
         if ("venatus" in current_url or "reward-demo" in current_url or
             "reward_demo" in current_url or "reward-video" in current_url):
-            if not cancel_clicked and elapsed >= 3:
+            if not cancel_clicked:
                 log("检测到广告页，尝试点击右上角 Cancel 按钮...")
                 if _click_venatus_cancel(sb):
                     cancel_clicked = True
                     log("✅ 已点击 Cancel，等待页面响应...")
                     time.sleep(3)
-                    # 点击 Cancel 后常会弹出 Alert
                     if _dismiss_alert_if_present(sb):
                         log("✅ Cancel 后处理了 Alert「确定」")
                         return True
                 else:
-                    # 兜底：用通用关闭逻辑
+                    log("未找到 Cancel，尝试通用关闭...")
                     _try_close_ad_overlay(sb)
-            if elapsed % 10 == 0:
-                log(f"仍在广告页 [{elapsed}s]: {current_url[:60]}")
+                    time.sleep(2)
+            else:
+                # 已点过 Cancel，继续等 Alert 或跳转
+                if elapsed % 5 == 0:
+                    log(f"已点 Cancel，等待 Alert 或跳转... [{elapsed}s]")
             time.sleep(1)
             continue
 
-        # ④ 其他情况（adblocker 等）
+        # ③ 已回到控制台（且之前确实离开过）→ 结束广告流程
+        if console_path in current_url:
+            if navigated_away or cancel_clicked or elapsed > 5:
+                log("已回到控制台页面，结束广告流程")
+                time.sleep(1)
+                if _dismiss_alert_if_present(sb):
+                    log("✅ 回到控制台后处理了 Alert")
+                return True
+            # 刚开始还没跳转，继续等
+            time.sleep(1)
+            continue
+
+        # ④ 其他情况
         situation = _get_page_situation(sb)
         if situation == 'adblocker':
             log("检测到广告拦截器页面")
@@ -715,7 +739,6 @@ def handle_reward_ad_flow(sb, identifier: str, console_url: str) -> bool:
             continue
 
         if situation == 'reward':
-            # 有完整广告观看按钮的情况，走原逻辑
             log("检测到完整广告观看页，尝试处理...")
             return _execute_reward_ad_watch(sb, identifier)
 
@@ -1191,16 +1214,27 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
     handle_reward_ad_flow(sb, identifier, console_url)
     log("=== 广告流程处理完毕 ===")
 
-    # ── Step 5: 确保回到控制台页面 ──
-    time.sleep(2)
-    current_url = sb.get_current_url()
-    if identifier not in current_url or "reward" in current_url:
-        log(f"当前不在控制台页面（{current_url[:80]}），重新导航...")
+    # ── Step 5: 确保回到控制台页面（若仍在广告页则先点 Cancel，不直接强跳）──
+    time.sleep(1)
+    current_url = sb.get_current_url() or ""
+    if "venatus" in current_url or "reward-demo" in current_url or "reward_demo" in current_url or "reward-video" in current_url:
+        log(f"广告流程后仍在广告页，再次尝试 Cancel: {current_url[:60]}")
+        _click_venatus_cancel(sb)
+        time.sleep(2)
+        _dismiss_alert_if_present(sb)
+        time.sleep(2)
+        current_url = sb.get_current_url() or ""
+
+    if identifier not in current_url or "venatus" in current_url or "reward" in current_url:
+        log(f"仍不在控制台，导航回控制台: {current_url[:60]}")
         sb.get(console_url)
         time.sleep(4)
+        # 导航回来后可能还有 Alert
+        _dismiss_alert_if_present(sb)
         block_ads_modals(sb)
     else:
         log("当前在控制台页面，无需重新导航")
+        _dismiss_alert_if_present(sb)
         block_ads_modals(sb)
 
     # ── Step 6: 处理 CF Turnstile 验证弹窗 ──
