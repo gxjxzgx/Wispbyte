@@ -20,6 +20,11 @@ LOGIN_URL = "https://wispbyte.com/client"
 DASHBOARD_URL = "https://wispbyte.com/client/dashboard"
 CONSOLE_URL_TEMPLATE = "https://wispbyte.com/client/servers/{identifier}/console"
 REWARD_VIDEO_URL = "https://wispbyte.com/client/reward-video"
+API_BASE = "https://wispbyte.com/client"
+API_STATUS = f"{API_BASE}/api/servers/status"
+API_CAPTCHA_STATUS = f"{API_BASE}/api/server/start-captcha/status"
+API_CAPTCHA_REWARDED = f"{API_BASE}/api/server/start-captcha/rewarded"
+API_SERVER_START = f"{API_BASE}/api/server/start"
 
 WORKSPACE = os.environ.get("GITHUB_WORKSPACE", str(Path.cwd()))
 OUTPUT_DIR = Path(WORKSPACE) / "output/screenshots"
@@ -1020,6 +1025,136 @@ def get_servers(sb) -> List[str]:
     return []
 
 
+# ====================== 混合方案：Cookie + API ======================
+def get_browser_cookies(sb) -> dict:
+    """从当前浏览器会话提取 Cookie 字典。"""
+    cookies = {}
+    try:
+        for c in sb.driver.get_cookies():
+            cookies[c["name"]] = c["value"]
+    except Exception as e:
+        log(f"提取 Cookie 失败: {e}", "WARN")
+    return cookies
+
+
+def api_headers(referer: str = None) -> dict:
+    return {
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": referer or f"{API_BASE}/servers",
+    }
+
+
+def api_get_captcha_status(cookies: dict) -> dict:
+    """
+    GET /api/server/start-captcha/status
+    返回如 {"valid": true/false, "expiresAt": "...", ...}
+    """
+    try:
+        resp = requests.get(
+            API_CAPTCHA_STATUS,
+            cookies=cookies,
+            headers=api_headers(),
+            timeout=20,
+        )
+        if resp.ok:
+            return resp.json() if resp.content else {}
+        log(f"captcha status HTTP {resp.status_code}: {resp.text[:120]}", "WARN")
+    except Exception as e:
+        log(f"captcha status 异常: {e}", "WARN")
+    return {}
+
+
+def api_refresh_rewarded(cookies: dict) -> Tuple[bool, dict]:
+    """
+    POST /api/server/start-captcha/rewarded
+    尝试续期 5 小时启动资格（无需完整看广告）。
+    返回 (成功?, 更新后的 cookies)
+    """
+    try:
+        resp = requests.post(
+            API_CAPTCHA_REWARDED,
+            cookies=cookies,
+            headers={**api_headers(), "Content-Type": "application/json"},
+            json={},
+            timeout=25,
+        )
+        text = resp.text[:200]
+        log(f"rewarded 响应: {resp.status_code} {text}")
+        if resp.ok:
+            data = {}
+            try:
+                data = resp.json()
+            except Exception:
+                pass
+            # 合并可能的 Set-Cookie
+            new_cookies = dict(cookies)
+            for c in resp.cookies:
+                new_cookies[c.name] = c.value
+            if data.get("success") is True or resp.status_code == 200:
+                return True, new_cookies
+        return False, cookies
+    except Exception as e:
+        log(f"rewarded 异常: {e}", "WARN")
+        return False, cookies
+
+
+def api_start_server(cookies: dict, identifier: str) -> Tuple[bool, str]:
+    """
+    POST /api/server/start  { serverId }
+    返回 (成功?, 响应摘要)
+    """
+    try:
+        resp = requests.post(
+            API_SERVER_START,
+            cookies=cookies,
+            headers={
+                **api_headers(referer=CONSOLE_URL_TEMPLATE.format(identifier=identifier)),
+                "Content-Type": "application/json",
+            },
+            json={"serverId": identifier},
+            timeout=30,
+        )
+        body = resp.text[:300]
+        log(f"Start API: {resp.status_code} {body}")
+        if resp.ok:
+            return True, body
+        return False, f"{resp.status_code} {body}"
+    except Exception as e:
+        log(f"Start API 异常: {e}", "ERROR")
+        return False, str(e)
+
+
+def ensure_start_gate(sb, cookies: dict) -> Tuple[bool, dict]:
+    """
+    确保具备启动资格：
+      1. 查 captcha status，有效则直接通过
+      2. 无效则先尝试 rewarded API
+      3. 仍失败则走浏览器广告/Cancel/CF 流程获取资格
+    返回 (是否具备资格, cookies)
+    """
+    status = api_get_captcha_status(cookies)
+    if status.get("valid"):
+        exp = status.get("expiresAt") or status.get("expires") or "?"
+        log(f"✅ 启动资格有效（到期: {exp}），跳过广告")
+        return True, cookies
+
+    log("启动资格无效或未知，尝试 rewarded 续期...")
+    ok, cookies = api_refresh_rewarded(cookies)
+    if ok:
+        status2 = api_get_captcha_status(cookies)
+        if status2.get("valid") or ok:
+            log("✅ rewarded 续期成功")
+            return True, cookies
+
+    log("rewarded 未能获得资格，改用浏览器完成验证流程...")
+    return False, cookies
+
+
 def get_server_status(sb, identifier: str) -> Optional[str]:
     """
     通过 API 获取指定服务器的当前状态。
@@ -1127,11 +1262,16 @@ def should_force_restart(identifier: str) -> bool:
         return True
 
 
-# ====================== 重启 / 启动服务器（完整流程）======================
+# ====================== 重启 / 启动服务器（混合：浏览器资格 + API 开机）======================
 def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
     """
-    智能启动/重启流程。
-    返回: (是否成功, 最终状态描述, 执行的动作说明)
+    混合启动流程：
+      1. 浏览器登录后提取 Cookie
+      2. 查状态：正常且未满 5 天 → 跳过
+      3. 确保启动资格（API status → rewarded → 必要时浏览器 Cancel/CF）
+      4. 调用 POST /api/server/start 开机
+      5. 轮询直到 running
+    返回: (是否成功, 最终状态, 动作说明)
     """
     console_url = CONSOLE_URL_TEMPLATE.format(identifier=identifier)
     safe_id = mask_server_id(identifier)
@@ -1139,13 +1279,18 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
     log(f"处理服务器: {safe_id}")
     log(f"{'─'*40}")
 
-    # ── Step 1: 导航到控制台 ──
+    # ── Step 1: 导航到控制台（保持会话活跃）──
     log(f"导航到控制台: {safe_id}")
     sb.get(console_url)
-    time.sleep(4)
+    time.sleep(3)
     block_ads_modals(sb)
 
-    # ── Step 2: 检查状态并决定是否操作 ──
+    cookies = get_browser_cookies(sb)
+    if not cookies.get("connect.sid"):
+        log("未获取到 connect.sid，登录可能无效", "ERROR")
+        return False, "未知", "失败（无会话 Cookie）"
+
+    # ── Step 2: 状态判断 ──
     current_status = get_server_status(sb, identifier)
     log(f"当前服务器状态: {current_status or '未知'}")
 
@@ -1153,101 +1298,99 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
     force = should_force_restart(identifier)
 
     if running and not force:
-        log(f"✅ 服务器 {safe_id} 状态正常，且未到 {FORCE_RESTART_DAYS} 天强制重启周期，跳过")
+        log(f"✅ 服务器 {safe_id} 状态正常，未到 {FORCE_RESTART_DAYS} 天周期，跳过")
         return True, current_status or "running", "跳过（状态正常）"
 
     if running and force:
-        action = "Restart"
-        preferred_selectors = [
-            ('button#restart-btn', 'Restart'),
-            ('button#start-btn', 'Start'),
-        ]
-        log(f"服务器状态正常，但已到 {FORCE_RESTART_DAYS} 天强制重启周期，将执行重启")
         action_desc = "强制重启"
+        log(f"已到 {FORCE_RESTART_DAYS} 天强制重启周期")
     else:
-        # 状态异常（offline / stopped / starting / unknown 等）
-        action = "Start"
-        preferred_selectors = [
-            ('button#start-btn', 'Start'),
-            ('button#restart-btn', 'Restart'),
-        ]
-        log("服务器状态异常，将执行开机/重启操作")
-        action_desc = "开机/重启"
+        action_desc = "开机"
+        log("服务器离线/异常，准备开机")
 
-    # ── Step 3: 点击对应按钮 ──
-    action_btn = None
-    used_name = action
-    for btn_sel, btn_name in preferred_selectors:
+    # ── Step 3: 确保启动资格（混合）──
+    log("=== 检查启动资格（混合方案）===")
+    gate_ok, cookies = ensure_start_gate(sb, cookies)
+
+    if not gate_ok:
+        # 浏览器兜底：点 Start → Cancel → Alert → CF
+        log("=== 浏览器兜底：广告/Cancel/CF 流程 ===")
         try:
-            action_btn = sb.wait_for_element_visible(btn_sel, timeout=8)
-            used_name = btn_name
-            log(f"找到 {btn_name} 按钮")
-            break
-        except Exception:
-            continue
-
-    if not action_btn:
-        log("未找到 Start 或 Restart 按钮", "ERROR")
-        return False, current_status or "未知", f"失败（未找到按钮，原计划{action_desc}）"
-
-    try:
-        action_btn.click()
-        log(f"✅ 已点击 {used_name} 按钮")
-    except Exception:
-        try:
-            js_selector = "#restart-btn" if action == "Restart" else "#start-btn"
-            sb.execute_script(
-                f"var b = document.querySelector('{js_selector}') || "
-                f"document.querySelector('#start-btn, #restart-btn');"
-                f"if (b) b.click();"
-            )
-            log(f"✅ 已通过 JS 点击 {used_name} 按钮")
+            btn = None
+            for sel in ("button#start-btn", "button#restart-btn"):
+                try:
+                    btn = sb.wait_for_element_visible(sel, timeout=6)
+                    break
+                except Exception:
+                    continue
+            if btn:
+                try:
+                    btn.click()
+                except Exception:
+                    sb.execute_script(
+                        "var b=document.querySelector('#start-btn,#restart-btn');if(b)b.click();"
+                    )
+                log("已点击 Start/Restart，进入广告流程")
+                time.sleep(2)
+                handle_reward_ad_flow(sb, identifier, console_url)
+                # 若仍在广告页再点 Cancel
+                url = sb.get_current_url() or ""
+                if "venatus" in url or "reward" in url:
+                    _click_venatus_cancel(sb)
+                    time.sleep(2)
+                    _dismiss_alert_if_present(sb)
+                # 回到控制台并处理 CF
+                sb.get(console_url)
+                time.sleep(3)
+                _dismiss_alert_if_present(sb)
+                handle_restart_turnstile_modal(sb, timeout=90)
+                block_ads_modals(sb)
+                # 刷新 Cookie 后再试资格
+                cookies = get_browser_cookies(sb)
+                gate_ok, cookies = ensure_start_gate(sb, cookies)
+            else:
+                log("未找到 Start 按钮，无法走浏览器兜底", "WARN")
         except Exception as e:
-            log(f"点击 {used_name} 失败: {e}", "ERROR")
-            return False, current_status or "未知", f"失败（点击按钮异常，原计划{action_desc}）"
+            log(f"浏览器兜底异常: {e}", "WARN")
 
-    # 等待页面响应
-    time.sleep(3)
+    if not gate_ok:
+        log("未能获得启动资格，放弃 API 开机", "ERROR")
+        return False, current_status or "未知", f"{action_desc}失败（无启动资格）"
 
-    # ── Step 4: 处理广告流程 ──
-    log("=== 开始处理广告流程 ===")
-    handle_reward_ad_flow(sb, identifier, console_url)
-    log("=== 广告流程处理完毕 ===")
+    # ── Step 4: API 开机 ──
+    log("=== 调用 Start API ===")
+    # 强制重启时：若仍在 running，先不保证有 stop API，直接再发 start 或依赖面板
+    started, start_msg = api_start_server(cookies, identifier)
+    if not started:
+        # 若返回 captchaRequired，再试一次浏览器资格后重试
+        if "captcha" in start_msg.lower() or "403" in start_msg:
+            log("Start API 要求验证，重跑浏览器流程...")
+            try:
+                sb.get(console_url)
+                time.sleep(2)
+                sb.execute_script(
+                    "var b=document.querySelector('#start-btn,#restart-btn');if(b)b.click();"
+                )
+                time.sleep(2)
+                handle_reward_ad_flow(sb, identifier, console_url)
+                _click_venatus_cancel(sb)
+                _dismiss_alert_if_present(sb)
+                sb.get(console_url)
+                time.sleep(3)
+                handle_restart_turnstile_modal(sb, timeout=90)
+                cookies = get_browser_cookies(sb)
+                api_refresh_rewarded(cookies)
+                started, start_msg = api_start_server(cookies, identifier)
+            except Exception as e:
+                log(f"二次验证异常: {e}", "WARN")
 
-    # ── Step 5: 确保回到控制台页面（若仍在广告页则先点 Cancel，不直接强跳）──
-    time.sleep(1)
-    current_url = sb.get_current_url() or ""
-    if "venatus" in current_url or "reward-demo" in current_url or "reward_demo" in current_url or "reward-video" in current_url:
-        log(f"广告流程后仍在广告页，再次尝试 Cancel: {current_url[:60]}")
-        _click_venatus_cancel(sb)
-        time.sleep(2)
-        _dismiss_alert_if_present(sb)
-        time.sleep(2)
-        current_url = sb.get_current_url() or ""
-
-    if identifier not in current_url or "venatus" in current_url or "reward" in current_url:
-        log(f"仍不在控制台，导航回控制台: {current_url[:60]}")
-        sb.get(console_url)
-        time.sleep(4)
-        # 导航回来后可能还有 Alert
-        _dismiss_alert_if_present(sb)
-        block_ads_modals(sb)
+    if not started:
+        log(f"Start API 失败: {start_msg}", "ERROR")
+        # 仍轮询一次，有时异步已启动
     else:
-        log("当前在控制台页面，无需重新导航")
-        _dismiss_alert_if_present(sb)
-        block_ads_modals(sb)
+        log("✅ Start API 已接受请求")
 
-    # ── Step 6: 处理 CF Turnstile 验证弹窗 ──
-    log("=== 开始处理 CF Turnstile 验证 ===")
-    cf_result = handle_restart_turnstile_modal(sb, timeout=90)
-    if not cf_result:
-        log("CF Turnstile 验证失败", "WARN")
-    else:
-        log("=== CF Turnstile 验证完成 ===")
-
-    block_ads_modals(sb)
-
-    # ── Step 7: 轮询服务器状态 ──
+    # ── Step 5: 轮询状态 ──
     log(f"开始轮询服务器状态（最长 90 秒）: {safe_id}")
     poll_timeout = 90
     poll_interval = 5
@@ -1259,7 +1402,7 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
             status = get_server_status(sb, identifier)
             last_status = status
             if is_server_running(status):
-                log(f"✅ 服务器 {safe_id} 状态: {status}，{action} 成功！")
+                log(f"✅ 服务器 {safe_id} 状态: {status}，{action_desc}成功")
                 save_last_restart(identifier)
                 return True, status, f"{action_desc}成功"
             log(f"当前状态: {status or '未知'}，{poll_interval}s 后重试...")
@@ -1267,12 +1410,10 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
             log(f"状态检查异常: {e}", "WARN")
         time.sleep(poll_interval)
 
-    # 最终检查
     try:
         status = get_server_status(sb, identifier)
         last_status = status or last_status
         if is_server_running(status):
-            log(f"✅ 最终检查成功: {safe_id} 状态: {status}")
             save_last_restart(identifier)
             return True, status, f"{action_desc}成功"
         log(f"❌ 轮询超时，最终状态: {last_status or '未知'}", "ERROR")
