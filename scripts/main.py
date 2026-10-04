@@ -484,34 +484,119 @@ def _click_watch_ad_btn(sb) -> bool:
     return False
 
 
+def _try_close_ad_overlay(sb) -> bool:
+    """
+    尝试点击广告层中的关闭 / 取消 / Skip 按钮。
+    返回 True 表示成功点击了某个关闭按钮。
+    """
+    close_selectors = [
+        # 常见关闭按钮
+        'button[aria-label="Close"]',
+        'button[aria-label="close"]',
+        'button[title="Close"]',
+        'button[title="close"]',
+        '.close-button',
+        '.ad-close',
+        '.close-btn',
+        '#close-btn',
+        'button.close',
+        '[class*="close-button"]',
+        '[class*="closeBtn"]',
+        '[class*="CloseButton"]',
+        # Skip / Cancel
+        'button[aria-label="Skip"]',
+        'button[aria-label="skip"]',
+        '.skip-button',
+        '.skip-btn',
+        'button.skip',
+        '[class*="skip"]',
+        # 通用文本按钮
+        'button',
+        'a',
+        'div[role="button"]',
+    ]
+    try:
+        clicked = sb.execute_script('''
+            var keywords = ['close', 'skip', 'cancel', '关闭', '跳过', '取消', '×', '✕', 'x'];
+            var candidates = document.querySelectorAll(
+                'button, a, div[role="button"], span[role="button"], [class*="close"], [class*="skip"], [aria-label*="lose"], [aria-label*="kip"]'
+            );
+            for (var i = 0; i < candidates.length; i++) {
+                var el = candidates[i];
+                if (!el || el.offsetParent === null) continue;  // 不可见
+                var text = ((el.innerText || el.textContent || '') + ' ' +
+                            (el.getAttribute('aria-label') || '') + ' ' +
+                            (el.getAttribute('title') || '') + ' ' +
+                            (el.className || '')).toLowerCase();
+                for (var k = 0; k < keywords.length; k++) {
+                    if (text.indexOf(keywords[k]) !== -1) {
+                        try { el.click(); return true; } catch(e) {}
+                    }
+                }
+            }
+            // 尝试右上角小关闭图标
+            var svgs = document.querySelectorAll('svg, [class*="icon-close"], [class*="icon_close"]');
+            for (var j = 0; j < svgs.length; j++) {
+                var parent = svgs[j].closest('button, a, div[role="button"]') || svgs[j].parentElement;
+                if (parent && parent.offsetParent !== null) {
+                    try { parent.click(); return true; } catch(e) {}
+                }
+            }
+            return false;
+        ''')
+        if clicked:
+            log("✅ 已点击广告关闭/取消按钮")
+            time.sleep(2)
+            return True
+    except Exception as e:
+        log(f"查找关闭按钮异常: {e}", "WARN")
+    return False
+
+
 def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
     """
     等待广告观看完成。
-    完成信号（任意一个触发即可）：
-      1. URL 回到控制台页面（含 identifier）
-      2. URL 含 rewardDone=1
-      3. embedStatus 显示 "starting/saving/returning/session"
-      4. 页面离开 reward-video URL 且非 adblocker 页
+    改进点：
+      1. 点击 Watch ad 后先强制等待至少 5 秒
+      2. 期间及之后持续尝试点击关闭/取消按钮
+      3. 忽略 venatus-reward-demo 等中间跳转页，不误判为完成
+      4. 真正回到控制台或出现 rewardDone 才算完成
     """
     safe_id = mask_server_id(identifier)
     log(f"广告开始播放，等待完成（最长 {timeout}s）: {safe_id}")
     start = time.time()
     console_path = f"/servers/{identifier}/console"
 
+    # 强制先等待 5 秒，给广告弹出时间，并尝试找关闭按钮
+    log("等待 5 秒让广告弹出，并查找关闭/取消按钮...")
+    time.sleep(5)
+    _try_close_ad_overlay(sb)
+
     while time.time() - start < timeout:
         elapsed = int(time.time() - start)
         try:
-            current_url = sb.get_current_url()
+            current_url = sb.get_current_url() or ""
 
-            # 信号1: URL 含 rewardDone=1
+            # 持续尝试关闭广告层
+            if elapsed < 60 and elapsed % 8 == 0:
+                _try_close_ad_overlay(sb)
+
+            # 信号1: URL 含 rewardDone=1（真正完成）
             if "rewardDone=1" in current_url:
                 log(f"✅ 广告完成 [rewardDone]: {safe_id}")
                 return True
 
-            # 信号2: 回到控制台
+            # 信号2: 真正回到控制台页面（必须包含 /servers/{id}/console）
             if console_path in current_url:
                 log(f"✅ 广告完成 [回到控制台]: {safe_id}")
                 return True
+
+            # 忽略中间广告页（venatus 等），不算完成
+            if "venatus" in current_url or "reward-demo" in current_url or "reward_demo" in current_url:
+                if elapsed % 15 == 0:
+                    log(f"仍在广告中间页 [{elapsed}s]: {current_url[:70]}")
+                time.sleep(3)
+                continue
 
             # 信号3: embedStatus 显示完成文字
             try:
@@ -528,18 +613,21 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
                     text = status_info.get('text', '').lower()
                     if any(kw in text for kw in ['starting', 'saving', 'returning', 'session']):
                         log(f"✅ 广告完成 [embedStatus='{text[:50]}']: {safe_id}")
-                        # 等待实际跳转
-                        time.sleep(8)
+                        time.sleep(5)
                         return True
             except Exception:
                 pass
 
-            # 信号4: 离开 reward 页面
-            if "reward-video" not in current_url and elapsed > 10:
-                situation = _get_page_situation(sb)
-                if situation not in ('reward', 'adblocker', 'unknown'):
-                    log(f"✅ 广告完成 [页面已跳转到: {current_url[:80]}]: {safe_id}")
-                    return True
+            # 信号4: 离开 reward 相关页面，且已经过足够时间，回到正常页面
+            if elapsed > 20:
+                if ("reward-video" not in current_url and
+                    "venatus" not in current_url and
+                    "reward-demo" not in current_url and
+                    "reward_demo" not in current_url):
+                    situation = _get_page_situation(sb)
+                    if situation == 'console' or (identifier in current_url and "client" in current_url):
+                        log(f"✅ 广告完成 [页面已回到正常页: {current_url[:70]}]: {safe_id}")
+                        return True
 
             if elapsed % 15 == 0:
                 log(f"等待广告完成... [{elapsed}s] URL={current_url[:60]}")
