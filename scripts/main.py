@@ -304,43 +304,14 @@ def _flatten(obj, prefix=""):
         yield prefix, obj
 
 
-def extract_uptime_seconds(info: dict) -> Optional[float]:
-    """
-    从状态接口返回里提取服务器已运行秒数。
-    支持：*uptime*（数值，key 含 ms 或数值过大时按毫秒）、started_at 类时间戳/ISO 字符串。
-    """
-    now = time.time()
-    for path, val in _flatten(info):
-        key = path.lower()
-        leaf = key.split(".")[-1]
-        if "uptime" in leaf and isinstance(val, (int, float)) and not isinstance(val, bool):
-            if val <= 0:
-                return None
-            return val / 1000.0 if ("ms" in leaf or val > 3e8) else float(val)
-    for path, val in _flatten(info):
-        leaf = path.lower().split(".")[-1]
-        if leaf in ("started_at", "startedat", "start_time", "starttime", "last_started", "laststarted"):
-            try:
-                if isinstance(val, (int, float)):
-                    ts = val / 1000.0 if val > 1e11 else float(val)
-                else:
-                    ts = datetime.fromisoformat(str(val).replace("Z", "+00:00")).timestamp()
-                if 0 < ts <= now:
-                    return now - ts
-            except Exception:
-                continue
-    return None
-
-
 def parse_duration_text(text: str) -> Optional[float]:
-    """解析页面上的 '2d 3h 4m 5s' / '1m 10s' 形式时长。"""
-    if not text:
-        return None
-    toks = re.findall(r"(\d+)\s*(d|h|m|s)\b", text.lower())
-    if not toks:
+    """严格解析 '2d 3h 4m 5s' / '1m 10s'：整段文本必须只由「数字+单位」组成。"""
+    t = (text or "").strip().lower()
+    if not re.fullmatch(r"(?:\d+\s*[dhms]\s*)+", t):
         return None
     unit = {"d": 86400, "h": 3600, "m": 60, "s": 1}
-    return float(sum(int(n) * unit[u] for n, u in toks))
+    sec = float(sum(int(n) * unit[u] for n, u in re.findall(r"(\d+)\s*([dhms])", t)))
+    return sec if sec <= 400 * 86400 else None  # 超过 400 天视为异常
 
 
 SCRAPE_UPTIME_JS = r"""
@@ -373,11 +344,14 @@ def scrape_uptime_seconds(sb, identifier: str, console_url: str) -> Optional[flo
         for _ in range(14):
             last = sb.execute_script(SCRAPE_UPTIME_JS) or {}
             for cand in last.get("cands", []):
-                sec = parse_duration_text(cand)
-                if sec is not None:
-                    return sec
+                for line in cand.splitlines():
+                    sec = parse_duration_text(line)
+                    if sec is not None:
+                        log(f"运行时长来源: Uptime 项，原文 '{line.strip()}'")
+                        return sec
             sec = parse_duration_text(last.get("header", ""))
             if sec is not None:
+                log(f"运行时长来源: 顶部 Online，原文 '{last.get('header', '').strip()}'")
                 return sec
             time.sleep(1.5)
     except Exception as e:
@@ -1030,8 +1004,6 @@ def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat:
                     if is_server_running(final_status):
                         up = scrape_uptime_seconds(sb, server_id,
                                                    CONSOLE_URL_TEMPLATE.format(identifier=server_id))
-                        if up is None:
-                            up = extract_uptime_seconds(get_server_info(sb, server_id))
                     if up is not None:
                         uptime_text = fmt_duration(up)
                     elif is_server_running(final_status):
