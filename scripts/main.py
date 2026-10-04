@@ -1094,6 +1094,14 @@ def api_headers(referer: str = None) -> dict:
     }
 
 
+def _api_body_preview(resp) -> str:
+    """API 错误响应预览（避免刷整页 HTML）。"""
+    text = (resp.text or "")[:80].replace("\n", " ")
+    if "<html" in text.lower() or "<!doctype" in text.lower():
+        return f"(HTML 错误页, status={resp.status_code})"
+    return text
+
+
 def api_get_captcha_status(cookies: dict) -> dict:
     """
     GET /api/server/start-captcha/status
@@ -1107,8 +1115,11 @@ def api_get_captcha_status(cookies: dict) -> dict:
             timeout=20,
         )
         if resp.ok:
-            return resp.json() if resp.content else {}
-        log(f"captcha status HTTP {resp.status_code}: {resp.text[:120]}", "WARN")
+            try:
+                return resp.json() if resp.content else {}
+            except Exception:
+                return {}
+        log(f"captcha status HTTP {resp.status_code}: {_api_body_preview(resp)}", "WARN")
     except Exception as e:
         log(f"captcha status 异常: {e}", "WARN")
     return {}
@@ -1128,15 +1139,13 @@ def api_refresh_rewarded(cookies: dict) -> Tuple[bool, dict]:
             json={},
             timeout=25,
         )
-        text = resp.text[:200]
-        log(f"rewarded 响应: {resp.status_code} {text}")
+        log(f"rewarded 响应: {resp.status_code} {_api_body_preview(resp)}")
         if resp.ok:
             data = {}
             try:
                 data = resp.json()
             except Exception:
                 pass
-            # 合并可能的 Set-Cookie
             new_cookies = dict(cookies)
             for c in resp.cookies:
                 new_cookies[c.name] = c.value
@@ -1373,6 +1382,8 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
     else:
         log("=== 跳过 API 资格检查，直接浏览器流程 ===")
 
+    browser_started = False  # 是否已通过浏览器点过 Start
+
     if not gate_ok:
         # 浏览器兜底：点 Start → Cancel → Alert → CF
         log("=== 浏览器兜底：广告/Cancel/CF 流程 ===")
@@ -1392,59 +1403,60 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
                         "var b=document.querySelector('#start-btn,#restart-btn');if(b)b.click();"
                     )
                 log("已点击 Start/Restart，进入广告流程")
+                browser_started = True
                 time.sleep(2)
                 handle_reward_ad_flow(sb, identifier, console_url)
-                # 若仍在广告页再点 Cancel
                 url = sb.get_current_url() or ""
                 if "venatus" in url or "reward" in url:
                     _click_venatus_cancel(sb)
                     time.sleep(2)
                     _dismiss_alert_if_present(sb)
-                # 回到控制台并处理 CF
                 sb.get(console_url)
                 time.sleep(3)
                 _dismiss_alert_if_present(sb)
-                handle_restart_turnstile_modal(sb, timeout=90)
+                time.sleep(2)
+                log("等待 CF Turnstile（浏览器启动后）...")
+                handle_restart_turnstile_modal(sb, timeout=60)
                 block_ads_modals(sb)
-                # 刷新 Cookie 后再试资格（若可用）
                 cookies = get_browser_cookies(sb)
                 if cookies.get("connect.sid"):
                     use_api = True
-                    gate_ok, cookies = ensure_start_gate(sb, cookies)
-                else:
-                    # 纯浏览器路径：已点过 Start/CF，交给轮询判断成败
-                    gate_ok = True
-                    log("浏览器流程已执行，将通过状态轮询确认结果")
+                    ok2, cookies = ensure_start_gate(sb, cookies)
+                    if ok2:
+                        gate_ok = True
+                log("浏览器流程已执行，将轮询状态确认结果")
             else:
                 log("未找到 Start 按钮，无法走浏览器兜底", "WARN")
         except Exception as e:
             log(f"浏览器兜底异常: {e}", "WARN")
 
-    if not gate_ok and use_api:
-        log("未能获得启动资格，放弃 API 开机", "ERROR")
+    # 既无 API 资格、又没点过浏览器 Start → 才算彻底失败
+    if not gate_ok and not browser_started:
+        log("未能获得启动资格且未执行浏览器启动", "ERROR")
         return False, current_status or "未知", f"{action_desc}失败（无启动资格）"
 
-    # ── Step 4: API 开机（有 Cookie 时）──
+    # ── Step 4: API 开机（有资格时尝试；失败仍轮询）──
     started = False
-    if use_api and cookies.get("connect.sid"):
+    if gate_ok and use_api and cookies.get("connect.sid"):
         log("=== 调用 Start API ===")
         started, start_msg = api_start_server(cookies, identifier)
         if not started:
             if "captcha" in start_msg.lower() or "403" in start_msg:
-                log("Start API 要求验证，重跑浏览器流程...")
+                log("Start API 要求验证，补充浏览器流程...")
                 try:
                     sb.get(console_url)
                     time.sleep(2)
                     sb.execute_script(
                         "var b=document.querySelector('#start-btn,#restart-btn');if(b)b.click();"
                     )
+                    browser_started = True
                     time.sleep(2)
                     handle_reward_ad_flow(sb, identifier, console_url)
                     _click_venatus_cancel(sb)
                     _dismiss_alert_if_present(sb)
                     sb.get(console_url)
                     time.sleep(3)
-                    handle_restart_turnstile_modal(sb, timeout=90)
+                    handle_restart_turnstile_modal(sb, timeout=60)
                     cookies = get_browser_cookies(sb)
                     if cookies.get("connect.sid"):
                         api_refresh_rewarded(cookies)
@@ -1452,11 +1464,11 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
                 except Exception as e:
                     log(f"二次验证异常: {e}", "WARN")
         if not started:
-            log(f"Start API 失败: {start_msg}，仍将轮询状态", "WARN")
+            log(f"Start API 未成功: {start_msg}，改为轮询状态", "WARN")
         else:
             log("✅ Start API 已接受请求")
     else:
-        log("未使用 Start API，依赖浏览器操作结果")
+        log("依赖浏览器启动结果，进入状态轮询")
 
     # ── Step 5: 轮询状态 ──
     log(f"开始轮询服务器状态（最长 90 秒）: {safe_id}")
