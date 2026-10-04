@@ -1027,13 +1027,58 @@ def get_servers(sb) -> List[str]:
 
 # ====================== 混合方案：Cookie + API ======================
 def get_browser_cookies(sb) -> dict:
-    """从当前浏览器会话提取 Cookie 字典。"""
+    """
+    从当前浏览器会话提取 Cookie 字典。
+    多种方式重试，避免 WebDriver 瞬时断连导致失败。
+    """
     cookies = {}
+
+    # 方式1: 标准 get_cookies，带重试
+    for attempt in range(1, 4):
+        try:
+            raw = sb.driver.get_cookies()
+            for c in raw:
+                cookies[c["name"]] = c["value"]
+            if cookies.get("connect.sid"):
+                log(f"已提取 Cookie（含 connect.sid，共 {len(cookies)} 个）")
+                return cookies
+            if cookies:
+                log(f"已提取 Cookie（无 connect.sid，共 {len(cookies)} 个）", "WARN")
+                return cookies
+        except Exception as e:
+            log(f"get_cookies 第 {attempt} 次失败: {e}", "WARN")
+            time.sleep(1.5)
+            try:
+                _ = sb.get_current_url()
+            except Exception:
+                pass
+
+    # 方式2: CDP Network.getAllCookies
     try:
-        for c in sb.driver.get_cookies():
-            cookies[c["name"]] = c["value"]
+        result = sb.execute_cdp_cmd("Network.getAllCookies", {})
+        for c in result.get("cookies", []):
+            domain = c.get("domain") or ""
+            if "wispbyte" in domain or domain.startswith("."):
+                cookies[c["name"]] = c["value"]
+        if cookies.get("connect.sid"):
+            log(f"通过 CDP 提取 Cookie（含 connect.sid，共 {len(cookies)} 个）")
+            return cookies
     except Exception as e:
-        log(f"提取 Cookie 失败: {e}", "WARN")
+        log(f"CDP 提取 Cookie 失败: {e}", "WARN")
+
+    # 方式3: document.cookie（通常拿不到 HttpOnly）
+    try:
+        doc = sb.execute_script("return document.cookie || '';") or ""
+        for part in doc.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                cookies[k.strip()] = v.strip()
+        if cookies:
+            log("仅获得 document.cookie（可能无 connect.sid）", "WARN")
+    except Exception as e:
+        log(f"document.cookie 失败: {e}", "WARN")
+
     return cookies
 
 
@@ -1285,10 +1330,22 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
     time.sleep(3)
     block_ads_modals(sb)
 
+    # 稍等再取 Cookie，降低 WebDriver 断连概率
+    time.sleep(1)
     cookies = get_browser_cookies(sb)
-    if not cookies.get("connect.sid"):
-        log("未获取到 connect.sid，登录可能无效", "ERROR")
-        return False, "未知", "失败（无会话 Cookie）"
+    use_api = bool(cookies.get("connect.sid"))
+    if not use_api:
+        log("未获取到 connect.sid，将仅使用浏览器流程（不调用 Start API）", "WARN")
+        # 再刷新一次页面后重试
+        try:
+            sb.get(console_url)
+            time.sleep(3)
+            cookies = get_browser_cookies(sb)
+            use_api = bool(cookies.get("connect.sid"))
+            if use_api:
+                log("刷新后成功获取 connect.sid")
+        except Exception as e:
+            log(f"刷新后取 Cookie 仍失败: {e}", "WARN")
 
     # ── Step 2: 状态判断 ──
     current_status = get_server_status(sb, identifier)
@@ -1308,9 +1365,13 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
         action_desc = "开机"
         log("服务器离线/异常，准备开机")
 
-    # ── Step 3: 确保启动资格（混合）──
-    log("=== 检查启动资格（混合方案）===")
-    gate_ok, cookies = ensure_start_gate(sb, cookies)
+    # ── Step 3: 确保启动资格（混合；无 Cookie 时跳过 API）──
+    gate_ok = False
+    if use_api:
+        log("=== 检查启动资格（混合方案）===")
+        gate_ok, cookies = ensure_start_gate(sb, cookies)
+    else:
+        log("=== 跳过 API 资格检查，直接浏览器流程 ===")
 
     if not gate_ok:
         # 浏览器兜底：点 Start → Cancel → Alert → CF
@@ -1345,50 +1406,57 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
                 _dismiss_alert_if_present(sb)
                 handle_restart_turnstile_modal(sb, timeout=90)
                 block_ads_modals(sb)
-                # 刷新 Cookie 后再试资格
+                # 刷新 Cookie 后再试资格（若可用）
                 cookies = get_browser_cookies(sb)
-                gate_ok, cookies = ensure_start_gate(sb, cookies)
+                if cookies.get("connect.sid"):
+                    use_api = True
+                    gate_ok, cookies = ensure_start_gate(sb, cookies)
+                else:
+                    # 纯浏览器路径：已点过 Start/CF，交给轮询判断成败
+                    gate_ok = True
+                    log("浏览器流程已执行，将通过状态轮询确认结果")
             else:
                 log("未找到 Start 按钮，无法走浏览器兜底", "WARN")
         except Exception as e:
             log(f"浏览器兜底异常: {e}", "WARN")
 
-    if not gate_ok:
+    if not gate_ok and use_api:
         log("未能获得启动资格，放弃 API 开机", "ERROR")
         return False, current_status or "未知", f"{action_desc}失败（无启动资格）"
 
-    # ── Step 4: API 开机 ──
-    log("=== 调用 Start API ===")
-    # 强制重启时：若仍在 running，先不保证有 stop API，直接再发 start 或依赖面板
-    started, start_msg = api_start_server(cookies, identifier)
-    if not started:
-        # 若返回 captchaRequired，再试一次浏览器资格后重试
-        if "captcha" in start_msg.lower() or "403" in start_msg:
-            log("Start API 要求验证，重跑浏览器流程...")
-            try:
-                sb.get(console_url)
-                time.sleep(2)
-                sb.execute_script(
-                    "var b=document.querySelector('#start-btn,#restart-btn');if(b)b.click();"
-                )
-                time.sleep(2)
-                handle_reward_ad_flow(sb, identifier, console_url)
-                _click_venatus_cancel(sb)
-                _dismiss_alert_if_present(sb)
-                sb.get(console_url)
-                time.sleep(3)
-                handle_restart_turnstile_modal(sb, timeout=90)
-                cookies = get_browser_cookies(sb)
-                api_refresh_rewarded(cookies)
-                started, start_msg = api_start_server(cookies, identifier)
-            except Exception as e:
-                log(f"二次验证异常: {e}", "WARN")
-
-    if not started:
-        log(f"Start API 失败: {start_msg}", "ERROR")
-        # 仍轮询一次，有时异步已启动
+    # ── Step 4: API 开机（有 Cookie 时）──
+    started = False
+    if use_api and cookies.get("connect.sid"):
+        log("=== 调用 Start API ===")
+        started, start_msg = api_start_server(cookies, identifier)
+        if not started:
+            if "captcha" in start_msg.lower() or "403" in start_msg:
+                log("Start API 要求验证，重跑浏览器流程...")
+                try:
+                    sb.get(console_url)
+                    time.sleep(2)
+                    sb.execute_script(
+                        "var b=document.querySelector('#start-btn,#restart-btn');if(b)b.click();"
+                    )
+                    time.sleep(2)
+                    handle_reward_ad_flow(sb, identifier, console_url)
+                    _click_venatus_cancel(sb)
+                    _dismiss_alert_if_present(sb)
+                    sb.get(console_url)
+                    time.sleep(3)
+                    handle_restart_turnstile_modal(sb, timeout=90)
+                    cookies = get_browser_cookies(sb)
+                    if cookies.get("connect.sid"):
+                        api_refresh_rewarded(cookies)
+                        started, start_msg = api_start_server(cookies, identifier)
+                except Exception as e:
+                    log(f"二次验证异常: {e}", "WARN")
+        if not started:
+            log(f"Start API 失败: {start_msg}，仍将轮询状态", "WARN")
+        else:
+            log("✅ Start API 已接受请求")
     else:
-        log("✅ Start API 已接受请求")
+        log("未使用 Start API，依赖浏览器操作结果")
 
     # ── Step 5: 轮询状态 ──
     log(f"开始轮询服务器状态（最长 90 秒）: {safe_id}")
