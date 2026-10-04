@@ -49,6 +49,14 @@ jobs:
           stack: dual
           mode: client
 
+      - name: 恢复并保存重启记录缓存
+        uses: actions/cache@v4
+        with:
+          path: output/last_restarts.json
+          key: wispbyte-last-restarts-${{ github.run_id }}
+          restore-keys: |
+            wispbyte-last-restarts-
+
       - name: 执行重启脚本
         env:
           WISPBYTE_1: ${{ secrets.WISPBYTE_1 }}
