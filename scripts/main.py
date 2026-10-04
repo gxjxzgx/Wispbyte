@@ -43,18 +43,25 @@ for _noisy in ("seleniumbase", "selenium", "urllib3", "undetected_chromedriver")
 
 # ====================== 工具函数 ======================
 def mask_email(email: str) -> str:
+    """
+    账号脱敏格式：a***a@mail.com
+    - 本地部分保留首尾字符，中间用 *** 代替
+    - 域名完整保留
+    """
     if '@' not in email:
-        return email[:1] + "***"
+        if len(email) <= 2:
+            return email[0] + "***" if email else "***"
+        return email[0] + "***" + email[-1]
     local, domain = email.split('@', 1)
-    masked_local = local[:1] + "***" if local else "***"
-    if '.' in domain:
-        parts = domain.split('.')
-        tld = parts[-1]
-        first_char = domain[0]
-        masked_domain = f"{first_char}***.{tld}"
+    if not local:
+        masked_local = "***"
+    elif len(local) == 1:
+        masked_local = local + "***"
+    elif len(local) == 2:
+        masked_local = local[0] + "***" + local[1]
     else:
-        masked_domain = domain[:1] + "***"
-    return f"{masked_local}@{masked_domain}"
+        masked_local = local[0] + "***" + local[-1]
+    return f"{masked_local}@{domain}"
 
 
 def mask_server_id(identifier: str) -> str:
@@ -649,31 +656,82 @@ def _execute_reward_ad_watch(sb, identifier: str) -> bool:
 
 
 # ====================== 登录流程 ======================
-def login(sb, email: str, password: str) -> bool:
-    log("访问登录页...")
-    sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=10)
-    time.sleep(4)
-
+def _is_error_page(sb) -> bool:
+    """检测是否为 500 / 502 / 503 / nginx 错误页或空白页。"""
     try:
-        sb.wait_for_element_visible('input#email', timeout=15)
-        log("✅ 找到登录表单")
-    except TimeoutException:
-        log("未找到登录表单，尝试重新连接...", "WARN")
-        sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=10)
-        time.sleep(5)
+        title = (sb.get_title() or "").lower()
+        body = sb.execute_script("return (document.body && document.body.innerText) || '';") or ""
+        body_lower = body.lower()
+        if any(kw in title for kw in ["500", "502", "503", "error", "internal server"]):
+            return True
+        if any(kw in body_lower for kw in [
+            "500 internal server error", "502 bad gateway", "503 service",
+            "nginx/", "internal server error", "cloudflare"
+        ]):
+            return True
+        # 页面几乎空白且无登录表单
+        if len(body.strip()) < 30 and not sb.is_element_present("input#email"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def login(sb, email: str, password: str) -> bool:
+    """
+    登录流程，针对 500 错误页和加载失败增加多次重试。
+    """
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
+        log(f"访问登录页（第 {attempt}/{max_attempts} 次）...")
         try:
-            sb.wait_for_element_visible('input#email', timeout=10)
+            sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=12)
+        except Exception as e:
+            log(f"打开登录页异常: {e}", "WARN")
+
+        time.sleep(3 + attempt)  # 递增等待
+
+        # 检测错误页
+        if _is_error_page(sb):
+            log(f"检测到错误页/空白页（第 {attempt} 次），准备重试...", "WARN")
+            if attempt < max_attempts:
+                # 尝试更换 IP
+                restart_warp()
+                time.sleep(5)
+                continue
+            else:
+                log("多次重试后仍为错误页，登录失败", "ERROR")
+                return False
+
+        # 等待登录表单
+        try:
+            sb.wait_for_element_visible('input#email', timeout=18)
+            log("✅ 找到登录表单")
+            break
         except TimeoutException:
-            log("仍然未找到登录表单", "ERROR")
-            return False
+            log(f"未找到登录表单（第 {attempt} 次）", "WARN")
+            if attempt < max_attempts:
+                restart_warp()
+                time.sleep(4)
+                continue
+            else:
+                log("多次重试后仍未找到登录表单", "ERROR")
+                return False
+    else:
+        log("登录页加载失败", "ERROR")
+        return False
 
     log("填写登录信息...")
-    sb.type('input#email', email)
-    time.sleep(0.5)
-    sb.type('input#password', password)
-    time.sleep(0.5)
+    try:
+        sb.type('input#email', email)
+        time.sleep(0.6)
+        sb.type('input#password', password)
+        time.sleep(0.6)
+    except Exception as e:
+        log(f"填写登录信息失败: {e}", "ERROR")
+        return False
 
-    if not wait_for_turnstile_success(sb, timeout=35):
+    if not wait_for_turnstile_success(sb, timeout=40):
         log("登录 Turnstile 未通过", "ERROR")
         return False
 
@@ -681,13 +739,22 @@ def login(sb, email: str, password: str) -> bool:
     try:
         sb.click('button.login-btn')
     except Exception:
-        sb.execute_script('document.querySelector("form#login-form").submit()')
+        try:
+            sb.execute_script('document.querySelector("form#login-form").submit()')
+        except Exception as e:
+            log(f"提交登录失败: {e}", "ERROR")
+            return False
 
     log("等待跳转到仪表盘...")
-    for _ in range(15):
-        if "/dashboard" in sb.get_current_url() or "/client/dashboard" in sb.get_current_url():
+    for _ in range(20):
+        current = sb.get_current_url()
+        if "/dashboard" in current or "/client/dashboard" in current:
             log("已跳转到仪表盘")
             break
+        # 如果又跳回错误页，也算失败
+        if _is_error_page(sb):
+            log("跳转过程中出现错误页", "ERROR")
+            return False
         time.sleep(1)
     else:
         log("登录后未成功跳转到仪表盘", "ERROR")
@@ -810,6 +877,27 @@ def is_server_running(status: Optional[str]) -> bool:
     if not status:
         return False
     return 'running' in status.lower()
+
+
+def status_to_chinese(status: Optional[str]) -> str:
+    """将服务器状态翻译为中文。"""
+    if not status:
+        return "未知"
+    s = status.lower().strip()
+    mapping = {
+        "running": "运行中",
+        "offline": "离线",
+        "stopped": "已停止",
+        "starting": "启动中",
+        "stopping": "停止中",
+        "installing": "安装中",
+        "suspended": "已暂停",
+        "unknown": "未知",
+    }
+    for key, cn in mapping.items():
+        if key in s:
+            return cn
+    return status  # 未知状态保留原文
 
 
 def load_last_restarts() -> dict:
@@ -1038,7 +1126,7 @@ def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat:
                     f"{status_icon} {action_desc}\n\n"
                     f"账号: {mask_email(email)}\n"
                     f"服务器: {server_id}\n"
-                    f"最终状态: {final_status}\n\n"
+                    f"最终状态: {status_to_chinese(final_status)}\n\n"
                     f"Wispbyte Auto Restart"
                 )
                 send_tg_photo(tg_token, tg_chat, screenshot, caption)
