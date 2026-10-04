@@ -862,18 +862,10 @@ def should_force_restart(identifier: str) -> bool:
 
 
 # ====================== 重启 / 启动服务器（完整流程）======================
-def restart_server(sb, identifier: str) -> bool:
+def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
     """
-    智能启动/重启流程：
-    1. 导航到控制台
-    2. 检查当前状态：
-       - 状态正常（running）且未满 5 天 → 跳过
-       - 状态正常且已满 5 天 → 强制重启
-       - 状态异常 → 开机（Start）或重启（Restart）
-    3. 处理广告流程
-    4. 确保回到控制台页面
-    5. 处理 CF Turnstile 验证弹窗
-    6. 轮询直至状态变为 running，并记录操作时间
+    智能启动/重启流程。
+    返回: (是否成功, 最终状态描述, 执行的动作说明)
     """
     console_url = CONSOLE_URL_TEMPLATE.format(identifier=identifier)
     safe_id = mask_server_id(identifier)
@@ -896,7 +888,7 @@ def restart_server(sb, identifier: str) -> bool:
 
     if running and not force:
         log(f"✅ 服务器 {safe_id} 状态正常，且未到 {FORCE_RESTART_DAYS} 天强制重启周期，跳过")
-        return True  # 视为成功（无需操作）
+        return True, current_status or "running", "跳过（状态正常）"
 
     if running and force:
         action = "Restart"
@@ -905,6 +897,7 @@ def restart_server(sb, identifier: str) -> bool:
             ('button#start-btn', 'Start'),
         ]
         log(f"服务器状态正常，但已到 {FORCE_RESTART_DAYS} 天强制重启周期，将执行重启")
+        action_desc = "强制重启"
     else:
         # 状态异常（offline / stopped / starting / unknown 等）
         action = "Start"
@@ -913,6 +906,7 @@ def restart_server(sb, identifier: str) -> bool:
             ('button#restart-btn', 'Restart'),
         ]
         log("服务器状态异常，将执行开机/重启操作")
+        action_desc = "开机/重启"
 
     # ── Step 3: 点击对应按钮 ──
     action_btn = None
@@ -928,7 +922,7 @@ def restart_server(sb, identifier: str) -> bool:
 
     if not action_btn:
         log("未找到 Start 或 Restart 按钮", "ERROR")
-        return False
+        return False, current_status or "未知", f"失败（未找到按钮，原计划{action_desc}）"
 
     try:
         action_btn.click()
@@ -944,7 +938,7 @@ def restart_server(sb, identifier: str) -> bool:
             log(f"✅ 已通过 JS 点击 {used_name} 按钮")
         except Exception as e:
             log(f"点击 {used_name} 失败: {e}", "ERROR")
-            return False
+            return False, current_status or "未知", f"失败（点击按钮异常，原计划{action_desc}）"
 
     # 等待页面响应
     time.sleep(3)
@@ -977,18 +971,20 @@ def restart_server(sb, identifier: str) -> bool:
     block_ads_modals(sb)
 
     # ── Step 7: 轮询服务器状态 ──
-    log(f"开始轮询服务器状态（最长 60 秒）: {safe_id}")
-    poll_timeout = 60
+    log(f"开始轮询服务器状态（最长 90 秒）: {safe_id}")
+    poll_timeout = 90
     poll_interval = 5
     start_poll = time.time()
+    last_status = None
 
     while time.time() - start_poll < poll_timeout:
         try:
             status = get_server_status(sb, identifier)
+            last_status = status
             if is_server_running(status):
                 log(f"✅ 服务器 {safe_id} 状态: {status}，{action} 成功！")
                 save_last_restart(identifier)
-                return True
+                return True, status, f"{action_desc}成功"
             log(f"当前状态: {status or '未知'}，{poll_interval}s 后重试...")
         except Exception as e:
             log(f"状态检查异常: {e}", "WARN")
@@ -997,15 +993,16 @@ def restart_server(sb, identifier: str) -> bool:
     # 最终检查
     try:
         status = get_server_status(sb, identifier)
+        last_status = status or last_status
         if is_server_running(status):
             log(f"✅ 最终检查成功: {safe_id} 状态: {status}")
             save_last_restart(identifier)
-            return True
-        log(f"❌ 轮询超时，最终状态: {status or '未知'}", "ERROR")
-        return False
+            return True, status, f"{action_desc}成功"
+        log(f"❌ 轮询超时，最终状态: {last_status or '未知'}", "ERROR")
+        return False, last_status or "未知", f"{action_desc}失败（超时）"
     except Exception as e:
         log(f"最终状态检查失败: {e}", "ERROR")
-        return False
+        return False, last_status or "未知", f"{action_desc}失败（异常）"
 
 
 # ====================== 账号处理 ======================
@@ -1033,15 +1030,15 @@ def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat:
                 return
 
             for si, server_id in enumerate(servers, start=1):
-                success = restart_server(sb, server_id)
+                success, final_status, action_desc = restart_server(sb, server_id)
                 suffix = f"done-{si}" if len(servers) > 1 else "done"
                 screenshot = take_screenshot(sb, idx, suffix)
                 status_icon = "✅" if success else "❌"
-                status_text = "操作成功（或已跳过）" if success else "操作失败"
                 caption = (
-                    f"{status_icon} {status_text}\n\n"
+                    f"{status_icon} {action_desc}\n\n"
                     f"账号: {mask_email(email)}\n"
-                    f"服务器: {server_id}\n\n"
+                    f"服务器: {server_id}\n"
+                    f"最终状态: {final_status}\n\n"
                     f"Wispbyte Auto Restart"
                 )
                 send_tg_photo(tg_token, tg_chat, screenshot, caption)
