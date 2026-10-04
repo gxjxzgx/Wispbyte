@@ -343,7 +343,8 @@ def parse_duration_text(text: str) -> Optional[float]:
     return float(sum(int(n) * unit[u] for n, u in toks))
 
 
-SCRAPE_UPTIME_JS = """
+SCRAPE_UPTIME_JS = r"""
+var out = [];
 var els = document.querySelectorAll('*');
 for (var i = 0; i < els.length; i++) {
   var el = els[i];
@@ -351,28 +352,37 @@ for (var i = 0; i < els.length; i++) {
     var row = el.parentElement;
     for (var d = 0; d < 3 && row; d++, row = row.parentElement) {
       var t = (row.innerText || '').replace(/uptime/ig, '').trim();
-      if (t) return t;
+      if (t) out.push(t.slice(0, 60));
     }
   }
 }
-return '';
+var body = (document.body && document.body.innerText) || '';
+var m = body.match(/online\s*[\u2022\u00b7|-]?\s*((?:\d+\s*[dhms]\s*)+)/i);
+return {cands: out, header: m ? m[1] : ''};
 """
 
 
 def scrape_uptime_seconds(sb, identifier: str, console_url: str) -> Optional[float]:
-    """从控制台页面 Server info 的 Uptime 读取运行时长。"""
+    """从控制台页面读取运行时长：优先 Server info 的 Uptime，其次顶部 'Online • 时长'。"""
+    last = {}
     try:
         ensure_connected(sb)
         if f"/servers/{identifier}/console" not in safe_url(sb):
             sb.get(console_url)
             time.sleep(3)
-        for _ in range(8):
-            sec = parse_duration_text(sb.execute_script(SCRAPE_UPTIME_JS) or "")
+        for _ in range(14):
+            last = sb.execute_script(SCRAPE_UPTIME_JS) or {}
+            for cand in last.get("cands", []):
+                sec = parse_duration_text(cand)
+                if sec is not None:
+                    return sec
+            sec = parse_duration_text(last.get("header", ""))
             if sec is not None:
                 return sec
             time.sleep(1.5)
     except Exception as e:
         log(f"读取页面 Uptime 失败: {e}", "WARN")
+    log(f"页面未读到运行时长，候选文本: {last}", "WARN")
     return None
 
 
