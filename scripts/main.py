@@ -12,6 +12,7 @@ Wispbyte 自动开机/重启脚本（优化版）
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -328,6 +329,50 @@ def extract_uptime_seconds(info: dict) -> Optional[float]:
                     return now - ts
             except Exception:
                 continue
+    return None
+
+
+def parse_duration_text(text: str) -> Optional[float]:
+    """解析页面上的 '2d 3h 4m 5s' / '1m 10s' 形式时长。"""
+    if not text:
+        return None
+    toks = re.findall(r"(\d+)\s*(d|h|m|s)\b", text.lower())
+    if not toks:
+        return None
+    unit = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    return float(sum(int(n) * unit[u] for n, u in toks))
+
+
+SCRAPE_UPTIME_JS = """
+var els = document.querySelectorAll('*');
+for (var i = 0; i < els.length; i++) {
+  var el = els[i];
+  if (el.children.length === 0 && (el.textContent || '').trim().toLowerCase() === 'uptime') {
+    var row = el.parentElement;
+    for (var d = 0; d < 3 && row; d++, row = row.parentElement) {
+      var t = (row.innerText || '').replace(/uptime/ig, '').trim();
+      if (t) return t;
+    }
+  }
+}
+return '';
+"""
+
+
+def scrape_uptime_seconds(sb, identifier: str, console_url: str) -> Optional[float]:
+    """从控制台页面 Server info 的 Uptime 读取运行时长。"""
+    try:
+        ensure_connected(sb)
+        if f"/servers/{identifier}/console" not in safe_url(sb):
+            sb.get(console_url)
+            time.sleep(3)
+        for _ in range(8):
+            sec = parse_duration_text(sb.execute_script(SCRAPE_UPTIME_JS) or "")
+            if sec is not None:
+                return sec
+            time.sleep(1.5)
+    except Exception as e:
+        log(f"读取页面 Uptime 失败: {e}", "WARN")
     return None
 
 
@@ -971,18 +1016,23 @@ def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat:
                 for si, server_id in enumerate(servers, start=1):
                     success, final_status, action_desc = restart_server(sb, server_id)
                     all_ok = all_ok and success
-                    up = extract_uptime_seconds(get_server_info(sb, server_id))
+                    up = None
+                    if is_server_running(final_status):
+                        up = scrape_uptime_seconds(sb, server_id,
+                                                   CONSOLE_URL_TEMPLATE.format(identifier=server_id))
+                        if up is None:
+                            up = extract_uptime_seconds(get_server_info(sb, server_id))
                     if up is not None:
                         uptime_text = fmt_duration(up)
                     elif is_server_running(final_status):
-                        uptime_text = "未知（接口无此字段）"
+                        uptime_text = "未知"
                     else:
                         uptime_text = "未运行"
                     shot = take_screenshot(sb, idx, f"done-{si}" if len(servers) > 1 else "done")
                     caption = (
                         f"{'✅' if success else '❌'} {action_desc}\n\n"
                         f"账号: {mask_email(email)}\n"
-                        f"服务器: {mask_server_id(server_id)}\n"
+                        f"服务器: {server_id}\n"
                         f"最终状态: {status_to_chinese(final_status)}\n"
                         f"运行时长: {uptime_text}\n\n"
                         f"Wispbyte Auto Restart"
