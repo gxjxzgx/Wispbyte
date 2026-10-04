@@ -39,8 +39,6 @@ WORKSPACE = os.environ.get("GITHUB_WORKSPACE", str(Path.cwd()))
 OUTPUT_DIR = Path(WORKSPACE) / "output/screenshots"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-LAST_RESTART_FILE = Path(WORKSPACE) / "output/last_restarts.json"
-FORCE_RESTART_DAYS = 5
 
 START_BTN_JS = "var b=document.querySelector('#start-btn,#restart-btn');if(b){b.click();return true;}return false;"
 
@@ -74,6 +72,18 @@ def mask_server_id(identifier: str) -> str:
     if not identifier or len(identifier) <= 4:
         return "***"
     return identifier[:2] + "***" + identifier[-2:]
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    if d:
+        return f"{d}天{h}小时{m}分"
+    if h:
+        return f"{h}小时{m}分"
+    return f"{m}分{sec}秒" if m else f"{sec}秒"
 
 
 def log(msg: str, level: str = "INFO"):
@@ -272,12 +282,52 @@ def get_servers(sb) -> List[str]:
     return []
 
 
-def get_server_status(sb, identifier: str) -> Optional[str]:
+def get_server_info(sb, identifier: str) -> dict:
     st, data, _ = browser_fetch(sb, "GET", API_STATUS_PATH)
-    for s in data.get("servers") or []:
-        if s.get("identifier") == identifier:
-            val = s.get("current_state")
-            return str(val).strip() if val else None
+    for srv in data.get("servers") or []:
+        if srv.get("identifier") == identifier:
+            return srv
+    return {}
+
+
+def get_server_status(sb, identifier: str) -> Optional[str]:
+    val = get_server_info(sb, identifier).get("current_state")
+    return str(val).strip() if val else None
+
+
+def _flatten(obj, prefix=""):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _flatten(v, f"{prefix}.{k}" if prefix else str(k))
+    else:
+        yield prefix, obj
+
+
+def extract_uptime_seconds(info: dict) -> Optional[float]:
+    """
+    从状态接口返回里提取服务器已运行秒数。
+    支持：*uptime*（数值，key 含 ms 或数值过大时按毫秒）、started_at 类时间戳/ISO 字符串。
+    """
+    now = time.time()
+    for path, val in _flatten(info):
+        key = path.lower()
+        leaf = key.split(".")[-1]
+        if "uptime" in leaf and isinstance(val, (int, float)) and not isinstance(val, bool):
+            if val <= 0:
+                return None
+            return val / 1000.0 if ("ms" in leaf or val > 3e8) else float(val)
+    for path, val in _flatten(info):
+        leaf = path.lower().split(".")[-1]
+        if leaf in ("started_at", "startedat", "start_time", "starttime", "last_started", "laststarted"):
+            try:
+                if isinstance(val, (int, float)):
+                    ts = val / 1000.0 if val > 1e11 else float(val)
+                else:
+                    ts = datetime.fromisoformat(str(val).replace("Z", "+00:00")).timestamp()
+                if 0 < ts <= now:
+                    return now - ts
+            except Exception:
+                continue
     return None
 
 
@@ -295,49 +345,6 @@ def status_to_chinese(status: Optional[str]) -> str:
         if k in s:
             return cn
     return status
-
-
-# ====================== 重启记录 ======================
-def load_last_restarts() -> dict:
-    try:
-        if LAST_RESTART_FILE.exists():
-            with open(LAST_RESTART_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-    except Exception as e:
-        log(f"读取上次重启记录失败: {e}", "WARN")
-    return {}
-
-
-def save_last_restart(identifier: str):
-    try:
-        data = load_last_restarts()
-        data[identifier] = datetime.now().isoformat(timespec="seconds")
-        LAST_RESTART_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(LAST_RESTART_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        log(f"已记录服务器 {mask_server_id(identifier)} 操作时间")
-    except Exception as e:
-        log(f"保存重启记录失败: {e}", "WARN")
-
-
-def should_force_restart(identifier: str) -> bool:
-    last_str = load_last_restarts().get(identifier)
-    sid = mask_server_id(identifier)
-    if not last_str:
-        log(f"服务器 {sid} 无历史记录，需要执行操作")
-        return True
-    try:
-        days = (datetime.now() - datetime.fromisoformat(last_str)).total_seconds() / 86400
-        if days >= FORCE_RESTART_DAYS:
-            log(f"服务器 {sid} 距上次操作 {days:.1f} 天，达到 {FORCE_RESTART_DAYS} 天强制重启条件")
-            return True
-        log(f"服务器 {sid} 距上次操作仅 {days:.1f} 天，未达强制重启间隔")
-        return False
-    except Exception as e:
-        log(f"解析上次重启时间失败: {e}，将强制执行", "WARN")
-        return True
 
 
 # ====================== Turnstile ======================
@@ -859,8 +866,9 @@ def browser_verify_flow(sb, identifier: str, console_url: str) -> bool:
     return passed
 
 
-# ====================== 开机 / 重启 ======================
+# ====================== 开机 ======================
 def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
+    """状态正常 → 跳过；离线/异常 → 开机。"""
     console_url = CONSOLE_URL_TEMPLATE.format(identifier=identifier)
     safe_id = mask_server_id(identifier)
     log("─" * 40)
@@ -872,47 +880,37 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
     time.sleep(3)
     block_ads_modals(sb)
 
-    current_status = get_server_status(sb, identifier)
+    info = get_server_info(sb, identifier)
+    current_status = str(info.get("current_state") or "").strip() or None
     log(f"当前服务器状态: {current_status or '未知'}")
-    running = is_server_running(current_status)
-    force = should_force_restart(identifier)
+    log(f"状态接口字段: {sorted(p for p, _ in _flatten(info))}")
 
-    if running and not force:
-        log(f"✅ 服务器 {safe_id} 状态正常，未到 {FORCE_RESTART_DAYS} 天周期，跳过")
+    if is_server_running(current_status):
+        log(f"✅ 服务器 {safe_id} 状态正常，跳过")
         return True, current_status or "running", "跳过（状态正常）"
 
-    # ── 强制重启：运行中的服务器不能再调 start，必须走页面 Restart 按钮 ──
-    if running and force:
-        action_desc = "强制重启"
-        log("已到强制重启周期，通过页面 Restart 按钮执行")
-        triggered = browser_verify_flow(sb, identifier, console_url)
-        if not triggered:
-            return False, current_status or "未知", f"{action_desc}失败（验证未通过）"
-        time.sleep(8)
-    else:
-        action_desc = "开机"
-        log("服务器离线/异常，准备开机")
-        gate_ok = ensure_start_gate(sb)
-        started = False
-        if gate_ok:
+    action_desc = "开机"
+    log("服务器离线/异常，准备开机")
+    gate_ok = ensure_start_gate(sb)
+    started = False
+    if gate_ok:
+        started, msg = api_start_server(sb, identifier)
+        if not started:
+            log(f"Start API 未成功: {msg}", "WARN")
+    if not started:
+        log("=== 浏览器验证流程 ===")
+        passed = browser_verify_flow(sb, identifier, console_url)
+        log(f"浏览器验证{'通过' if passed else '未通过'}")
+        if passed:
+            # 验证通过通常只是发放资格，显式再调一次 Start
             started, msg = api_start_server(sb, identifier)
             if not started:
-                log(f"Start API 未成功: {msg}", "WARN")
-        if not started:
-            log("=== 浏览器验证流程 ===")
-            passed = browser_verify_flow(sb, identifier, console_url)
-            log(f"浏览器验证{'通过' if passed else '未通过'}")
-            if passed:
-                # 验证通过通常只是发放资格，显式再调一次 Start
-                started, msg = api_start_server(sb, identifier)
-                if not started:
-                    log(f"验证后 Start API 未成功: {msg}，改为轮询状态", "WARN")
-            elif not gate_ok:
-                # 最后兜底：再查一次资格，可能已被浏览器流程续上
-                if ensure_start_gate(sb):
-                    started, _ = api_start_server(sb, identifier)
-                if not started:
-                    return False, current_status or "未知", f"{action_desc}失败（无启动资格）"
+                log(f"验证后 Start API 未成功: {msg}，改为轮询状态", "WARN")
+        elif not gate_ok:
+            if ensure_start_gate(sb):
+                started, _ = api_start_server(sb, identifier)
+            if not started:
+                return False, current_status or "未知", f"{action_desc}失败（无启动资格）"
 
     # ── 轮询状态 ──
     log(f"开始轮询服务器状态（最长 90 秒）: {safe_id}")
@@ -923,7 +921,6 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
             last_status = status
             if is_server_running(status):
                 log(f"✅ 服务器 {safe_id} 状态: {status}，{action_desc}成功")
-                save_last_restart(identifier)
                 return True, status, f"{action_desc}成功"
             log(f"当前状态: {status or '未知'}，5s 后重试...")
         except Exception as e:
@@ -932,7 +929,6 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
 
     status = get_server_status(sb, identifier) or last_status
     if is_server_running(status):
-        save_last_restart(identifier)
         return True, status, f"{action_desc}成功"
     log(f"轮询超时，最终状态: {status or '未知'}", "ERROR")
     return False, status or "未知", f"{action_desc}失败（超时）"
@@ -975,12 +971,20 @@ def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat:
                 for si, server_id in enumerate(servers, start=1):
                     success, final_status, action_desc = restart_server(sb, server_id)
                     all_ok = all_ok and success
+                    up = extract_uptime_seconds(get_server_info(sb, server_id))
+                    if up is not None:
+                        uptime_text = fmt_duration(up)
+                    elif is_server_running(final_status):
+                        uptime_text = "未知（接口无此字段）"
+                    else:
+                        uptime_text = "未运行"
                     shot = take_screenshot(sb, idx, f"done-{si}" if len(servers) > 1 else "done")
                     caption = (
                         f"{'✅' if success else '❌'} {action_desc}\n\n"
                         f"账号: {mask_email(email)}\n"
                         f"服务器: {mask_server_id(server_id)}\n"
-                        f"最终状态: {status_to_chinese(final_status)}\n\n"
+                        f"最终状态: {status_to_chinese(final_status)}\n"
+                        f"运行时长: {uptime_text}\n\n"
                         f"Wispbyte Auto Restart"
                     )
                     send_tg_photo(tg_token, tg_chat, shot, caption)
