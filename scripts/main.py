@@ -9,6 +9,10 @@ Wispbyte 自动开机/重启脚本（优化版）
   - 验证通过后显式调用 Start API
   - 修复 login 重试、关闭按钮误点、续期判断恒真、强制重启逻辑等
   - 临时目录清理、单账号异常隔离、失败时退出码非 0
+  - 轮询节流改为基于时间戳（原 elapsed % N 写法几乎不触发）
+  - Turnstile 判定限定在验证弹窗内，避免残留 token 误判
+  - 有资格但 Start API 失败、浏览器验证也未通过时不再空等轮询
+  - 服务器 ID 兜底提取增加格式校验；WARP 重注册失败时尝试原样重连
 """
 
 import os
@@ -40,6 +44,8 @@ WORKSPACE = os.environ.get("GITHUB_WORKSPACE", str(Path.cwd()))
 OUTPUT_DIR = Path(WORKSPACE) / "output/screenshots"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+
+SERVER_ID_RE = re.compile(r"[0-9a-fA-F]{8}")
 
 START_BTN_JS = "var b=document.querySelector('#start-btn,#restart-btn');if(b){b.click();return true;}return false;"
 
@@ -85,6 +91,21 @@ def fmt_duration(seconds: float) -> str:
     if h:
         return f"{h}小时{m}分"
     return f"{m}分{sec}秒" if m else f"{sec}秒"
+
+
+class Throttle:
+    """按时间间隔节流：ready() 距上次触发超过 interval 秒时返回 True。"""
+
+    def __init__(self, interval: float, fire_first: bool = True):
+        self.interval = interval
+        self.last = 0.0 if fire_first else time.time()
+
+    def ready(self) -> bool:
+        now = time.time()
+        if now - self.last >= self.interval:
+            self.last = now
+            return True
+        return False
 
 
 def log(msg: str, level: str = "INFO"):
@@ -139,7 +160,14 @@ def restart_warp() -> bool:
         log(f"WARP 重连成功，新 IP: {new_ip}")
         return True
     except Exception as e:
-        log(f"WARP 重连失败: {e}", "ERROR")
+        log(f"WARP 重连失败: {e}，尝试直接 connect 兜底", "ERROR")
+        try:
+            subprocess.run(["sudo", "warp-cli", "--accept-tos", "connect"], timeout=30, capture_output=True)
+            time.sleep(8)
+            requests.get("https://api.ipify.org", timeout=10)
+            log("WARP 兜底连接成功（IP 可能未更换）", "WARN")
+        except Exception as e2:
+            log(f"WARP 兜底连接也失败，后续请求可能无网络: {e2}", "ERROR")
         return False
 
 
@@ -274,9 +302,10 @@ def get_servers(sb) -> List[str]:
             return Array.from(document.querySelectorAll('[data-server-id], .server-card, .server-item'))
               .map(function(el){return el.getAttribute('data-server-id') || el.id;}).filter(Boolean);
         """)
+        dom_ids = [i for i in dict.fromkeys(dom_ids or []) if SERVER_ID_RE.fullmatch(str(i))]
         if dom_ids:
             log(f"从 DOM 提取到 {len(dom_ids)} 台服务器")
-            return list(dom_ids)
+            return dom_ids
     except Exception as e:
         log(f"DOM 提取失败: {e}", "WARN")
     log("未能获取任何服务器标识符", "ERROR")
@@ -377,17 +406,22 @@ def status_to_chinese(status: Optional[str]) -> str:
 
 
 # ====================== Turnstile ======================
-def check_turnstile_solved(sb) -> bool:
+def check_turnstile_solved(sb, scope: Optional[str] = None) -> bool:
+    """scope 为 CSS 选择器时只在该容器内判断（例如重启验证弹窗），避免页面上残留 token 误判。"""
     try:
         ensure_connected(sb)
         return bool(sb.execute_script("""
-            var inp = document.querySelector('input[name="cf-turnstile-response"]');
+            var sel = arguments[0];
+            var root = sel ? document.querySelector(sel) : document;
+            if (!root) return false;
+            var inp = root.querySelector('input[name="cf-turnstile-response"]');
             if (inp && inp.value && inp.value.length > 20) return true;
-            var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            var iframe = root.querySelector('iframe[src*="challenges.cloudflare.com"]');
             if (iframe && iframe.getAttribute("data-state") === "solved") return true;
+            if (sel) return false;
             var success = document.getElementById('success');
             return !!(success && getComputedStyle(success).display !== 'none');
-        """))
+        """, scope))
     except Exception:
         return False
 
@@ -418,6 +452,8 @@ def wait_for_turnstile_success(sb, timeout: int = 30) -> bool:
     log("⏰ Turnstile 验证超时", "WARN")
     return False
 
+
+MODAL_SELECTOR = ".wisp-start-captcha-modal"
 
 MODAL_VISIBLE_JS = """
     var el = document.querySelector('.wisp-start-captcha-modal');
@@ -455,7 +491,7 @@ def handle_restart_turnstile_modal(sb, timeout: int = 90, wait_modal: int = 20) 
         if not _modal_visible(sb):
             log("✅ CF Turnstile 弹窗已关闭，验证完成")
             return True
-        if check_turnstile_solved(sb):
+        if check_turnstile_solved(sb, MODAL_SELECTOR):
             log("Turnstile 已解决，等待弹窗自动关闭...")
             for _ in range(15):
                 if not _modal_visible(sb):
@@ -469,7 +505,7 @@ def handle_restart_turnstile_modal(sb, timeout: int = 90, wait_modal: int = 20) 
             last_click = time.time()
         time.sleep(1)
 
-    if not _modal_visible(sb) or check_turnstile_solved(sb):
+    if not _modal_visible(sb) or check_turnstile_solved(sb, MODAL_SELECTOR):
         log("✅ 超时后验证已完成")
         return True
     log("CF Turnstile 弹窗处理超时", "WARN")
@@ -580,6 +616,7 @@ def _click_venatus_cancel(sb) -> bool:
 def _wait_for_reward_btn_ready(sb, timeout: int = 60) -> bool:
     log(f"等待广告视频加载就绪（最长 {timeout}s）...")
     start = time.time()
+    log_t = Throttle(10)
     while time.time() - start < timeout:
         elapsed = int(time.time() - start)
         try:
@@ -597,7 +634,7 @@ def _wait_for_reward_btn_ready(sb, timeout: int = 60) -> bool:
             if r and r.get("ready"):
                 log("✅ 广告已就绪，Watch ad 按钮可点击")
                 return True
-            if elapsed % 10 == 0:
+            if log_t.ready():
                 log(f"广告加载中... [{elapsed}s] reason={(r or {}).get('reason')}")
         except Exception as e:
             log(f"检查广告就绪状态异常: {e}", "WARN")
@@ -633,17 +670,19 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 180) -> bool:
     console_path = f"/servers/{identifier}/console"
     time.sleep(5)
     _try_close_ad_overlay(sb)
+    close_t, mid_log_t, log_t = Throttle(8, False), Throttle(15), Throttle(15)
     while time.time() - start < timeout:
         elapsed = int(time.time() - start)
         try:
             url = safe_url(sb)
-            if elapsed < 60 and elapsed % 8 == 0:
-                _try_close_ad_overlay(sb)
             if "rewardDone=1" in url or console_path in url:
                 log(f"✅ 广告完成: {safe_id}")
                 return True
+            # 只在广告页内才尝试点关闭，避免回到控制台后误点其它 Cancel
+            if elapsed < 60 and close_t.ready():
+                _try_close_ad_overlay(sb)
             if any(k in url for k in ("venatus", "reward-demo", "reward_demo")):
-                if elapsed % 15 == 0:
+                if mid_log_t.ready():
                     log(f"仍在广告中间页 [{elapsed}s]")
                 time.sleep(3)
                 continue
@@ -661,7 +700,7 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 180) -> bool:
                         return True
             except Exception:
                 pass
-            if elapsed % 15 == 0:
+            if log_t.ready():
                 log(f"等待广告完成... [{elapsed}s]")
         except Exception as e:
             log(f"广告完成检测异常: {e}", "WARN")
@@ -715,6 +754,7 @@ def handle_reward_ad_flow(sb, identifier: str) -> bool:
         time.sleep(1)
 
     start, max_wait, cancel_clicked = time.time(), 40, False
+    wait_log_t = Throttle(5)
     while time.time() - start < max_wait:
         elapsed = int(time.time() - start)
         if _dismiss_alert_if_present(sb):
@@ -732,7 +772,7 @@ def handle_reward_ad_flow(sb, identifier: str) -> bool:
                 else:
                     _try_close_ad_overlay(sb)
                     time.sleep(2)
-            elif elapsed % 5 == 0:
+            elif wait_log_t.ready():
                 log(f"已点 Cancel，等待 Alert 或跳转... [{elapsed}s]")
             time.sleep(1)
             continue
@@ -897,7 +937,7 @@ def browser_verify_flow(sb, identifier: str, console_url: str) -> bool:
 
 # ====================== 开机 ======================
 def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
-    """状态正常 → 跳过；离线/异常 → 开机。"""
+    """仅在需要时开机：状态 running → 跳过；离线/异常 → 走资格校验 + Start。"""
     console_url = CONSOLE_URL_TEMPLATE.format(identifier=identifier)
     safe_id = mask_server_id(identifier)
     log("─" * 40)
@@ -935,11 +975,13 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str, str]:
             started, msg = api_start_server(sb, identifier)
             if not started:
                 log(f"验证后 Start API 未成功: {msg}，改为轮询状态", "WARN")
-        elif not gate_ok:
+        else:
+            # 验证未通过：重新确认资格并再试一次 Start，仍失败则直接返回，不再空等轮询
             if ensure_start_gate(sb):
                 started, _ = api_start_server(sb, identifier)
-            if not started:
-                return False, current_status or "未知", f"{action_desc}失败（无启动资格）"
+            if not started and not is_server_running(get_server_status(sb, identifier)):
+                reason = "无启动资格" if not gate_ok else "Start API 失败且验证未通过"
+                return False, current_status or "未知", f"{action_desc}失败（{reason}）"
 
     # ── 轮询状态 ──
     log(f"开始轮询服务器状态（最长 90 秒）: {safe_id}")
