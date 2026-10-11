@@ -1068,36 +1068,59 @@ TG_TEXT_LIMIT = 4096
 TG_MEDIA_MAX = 10
 
 
-def build_report(records: List[dict], elapsed: float, mask: bool = False) -> str:
-    """mask=True 时打码服务器 ID 和 IP（用于公开的 Actions 日志）。"""
-    sid = mask_server_id if mask else (lambda x: x)
+def build_report(records: List[dict], elapsed: float, mask: bool = False, html: bool = False) -> str:
+    """
+    生成运行汇总。
+    mask=True：打码服务器 ID 和 IP（用于公开的 Actions 日志）
+    html=True：使用 Telegram HTML 格式（加粗标题、ID/IP 等宽可点击复制）
+    """
+    from html import escape
+
     def ipf(ip: str) -> str:
         if not mask:
             return ip
         if ":" in ip:  # IPv6 只保留前两段
             return ":".join(ip.split(":")[:2]) + ":*"
         return re.sub(r"\.\d+\.\d+$", ".*.*", ip)
-    servers = [s for r in records for s in r["servers"]]
-    skipped = sum(1 for s in servers if s["ok"] and s["action"].startswith("跳过"))
-    started = sum(1 for s in servers if s["ok"] and not s["action"].startswith("跳过"))
-    srv_failed = sum(1 for s in servers if not s["ok"])
+
+    b = (lambda t: f"<b>{escape(t)}</b>") if html else (lambda t: t)
+    c = (lambda t: f"<code>{escape(t)}</code>") if html else (lambda t: t)
+    e = escape if html else (lambda t: t)
+    sid = mask_server_id if mask else (lambda x: x)
+
+    servers = [x for r in records for x in r["servers"]]
+    skipped = sum(1 for x in servers if x["ok"] and x["action"].startswith("跳过"))
+    started = sum(1 for x in servers if x["ok"] and not x["action"].startswith("跳过"))
+    srv_failed = sum(1 for x in servers if not x["ok"])
     acc_failed = sum(1 for r in records if not r["ok"])
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+
+    head_icon = "✅" if acc_failed == 0 and srv_failed == 0 else "⚠️"
     lines = [
-        f"{'✅' if acc_failed == 0 else '⚠️'} Wispbyte 运行汇总",
-        f"时间: {datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')}（北京时间）",
-        f"耗时: {fmt_duration(elapsed)}",
-        f"账号: {len(records)} 个，失败 {acc_failed}",
-        f"服务器: {len(servers)} 台｜开机 {started}｜跳过 {skipped}｜失败 {srv_failed}",
+        f"{head_icon} {b('Wispbyte 运行汇总')}",
+        "",
+        f"🕐 时间：{now}（北京时间）",
+        f"⏱ 耗时：{fmt_duration(elapsed)}",
+        f"👤 账号：{len(records)} 个，成功 {len(records) - acc_failed}，失败 {acc_failed}",
+        f"🖥 服务器：{len(servers)} 台，开机 {started}，跳过 {skipped}，失败 {srv_failed}",
     ]
-    for r in records:
-        lines.append("")
-        lines.append(f"{'✅' if r['ok'] else '❌'} {mask_email(r['email'])}")
-        lines.append(f"🌐 出口IP: {ipf(r['ip'])}")
+    for n, r in enumerate(records, start=1):
+        lines += [
+            "",
+            "────────────",
+            f"{'✅' if r['ok'] else '❌'} {b(f'账号 {n}')}：{e(mask_email(r['email']))}",
+            f"🌐 出口 IP：{c(ipf(r['ip']))}",
+        ]
         if r["error"]:
-            lines.append(f"   {r['error']}")
-        for s in r["servers"]:
-            lines.append(f"   {'✅' if s['ok'] else '❌'} {sid(s['id'])}｜{s['action']}｜{s['status']}｜{s['uptime']}")
-    lines += ["", "Wispbyte Auto Restart"]
+            lines.append(f"⚠️ {e(r['error'])}")
+        for x in r["servers"]:
+            lines += [
+                "",
+                f"{'🟢' if x['ok'] else '🔴'} 服务器 {c(sid(x['id']))}",
+                f"      结果：{e(x['action'])}",
+                f"      状态：{e(x['status'])}",
+                f"      运行时长：{e(x['uptime'])}",
+            ]
     return "\n".join(lines)
 
 
@@ -1117,14 +1140,15 @@ def send_tg_report(token: str, chat_id: str, records: List[dict], elapsed: float
     """整次运行只发一条：截图相册 + 汇总文字作为说明；文字超过 1024 字时改为纯文字消息。"""
     if not token or not chat_id:
         return
-    text = build_report(records, elapsed)
+    text = build_report(records, elapsed, html=True)
+    plain = build_report(records, elapsed)
     # 失败截图优先，最多 10 张
     fail_shots = [x for r in records if not r["ok"] for x in r["shots"]] + \
                  [s["shot"] for r in records for s in r["servers"] if not s["ok"]]
     ok_shots = [s["shot"] for r in records for s in r["servers"] if s["ok"]]
     shots = [p for p in dict.fromkeys(fail_shots + ok_shots) if p and os.path.exists(p)][:TG_MEDIA_MAX]
 
-    if shots and len(text) <= TG_CAPTION_LIMIT:
+    if shots and len(plain) <= TG_CAPTION_LIMIT:
         files, media = {}, []
         for n, path in enumerate(shots):
             key = f"p{n}"
@@ -1132,10 +1156,11 @@ def send_tg_report(token: str, chat_id: str, records: List[dict], elapsed: float
             item = {"type": "photo", "media": f"attach://{key}"}
             if n == 0:
                 item["caption"] = text
+                item["parse_mode"] = "HTML"
             media.append(item)
         try:
             if len(media) == 1:
-                ok = _tg_post(token, "sendPhoto", data={"chat_id": chat_id, "caption": text},
+                ok = _tg_post(token, "sendPhoto", data={"chat_id": chat_id, "caption": text, "parse_mode": "HTML"},
                               files={"photo": files["p0"]})
             else:
                 ok = _tg_post(token, "sendMediaGroup",
@@ -1147,8 +1172,11 @@ def send_tg_report(token: str, chat_id: str, records: List[dict], elapsed: float
         if ok:
             log("Telegram 汇总通知发送成功（含截图）")
             return
-    ok = _tg_post(token, "sendMessage", data={"chat_id": chat_id, "text": text[:TG_TEXT_LIMIT],
-                                              "disable_web_page_preview": True})
+    if len(text) <= TG_TEXT_LIMIT:
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    else:  # 超长时退回无格式文本截断，避免截断破坏 HTML 标签
+        data = {"chat_id": chat_id, "text": plain[:TG_TEXT_LIMIT], "disable_web_page_preview": True}
+    ok = _tg_post(token, "sendMessage", data=data)
     if ok:
         log("Telegram 汇总通知发送成功（纯文字）")
 
