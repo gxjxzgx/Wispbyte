@@ -18,8 +18,7 @@ jobs:
   restart:
     name: 执行重启脚本
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
+    timeout-minutes: 90
 
     steps:
       - name: 检出仓库
@@ -33,7 +32,7 @@ jobs:
       - name: 安装系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb ffmpeg unzip curl gnupg
+          sudo apt-get install -y xvfb
           wget -q -O /tmp/google-chrome-stable_current_amd64.deb \
             https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo dpkg -i /tmp/google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
@@ -48,14 +47,6 @@ jobs:
         with:
           stack: dual
           mode: client
-
-      - name: 恢复并保存重启记录缓存
-        uses: actions/cache@v4
-        with:
-          path: output/last_restarts.json
-          key: wispbyte-last-restarts-${{ github.run_id }}
-          restore-keys: |
-            wispbyte-last-restarts-
 
       - name: 执行重启脚本
         env:
