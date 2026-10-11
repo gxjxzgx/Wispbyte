@@ -13,6 +13,7 @@ Wispbyte 自动开机/重启脚本（优化版）
   - Turnstile 判定限定在验证弹窗内，避免残留 token 误判
   - 有资格但 Start API 失败、浏览器验证也未通过时不再空等轮询
   - 服务器 ID 兜底提取增加格式校验；WARP 重注册失败时尝试原样重连
+  - 运行时长优先走接口获取，页面读取延长等待并刷新重试；WARP 换 IP 校验新旧 IP 并重试
   - TG 推送合并为整次运行一条：汇总 + 每账号出口 IP + 每台服务器结果 + 截图相册
 """
 
@@ -114,42 +115,45 @@ def log(msg: str, level: str = "INFO"):
     logger.log(lv, f"[{level}] {msg}")
 
 
-def restart_warp() -> bool:
+def _warp(*args, timeout: int = 30):
+    return subprocess.run(["sudo", "warp-cli", "--accept-tos", *args], timeout=timeout, capture_output=True)
+
+
+def restart_warp(max_tries: int = 3) -> bool:
+    """重新注册 WARP 以更换出口 IP；新 IP 与旧 IP 相同则重试，最多 max_tries 次。"""
     log("正在重启 WARP 以更换 IP...")
-    try:
-        old_ip = requests.get("https://api.ipify.org", timeout=10).text
-        log(f"当前 IP: {old_ip}")
-    except Exception:
-        pass
-    try:
-        run = lambda *a: subprocess.run(["sudo", "warp-cli", "--accept-tos", *a],
-                                        timeout=30, capture_output=True)
-        run("disconnect")
-        time.sleep(3)
-        r = run("registration", "delete")
-        if r.returncode != 0:
-            log("删除注册失败（可能未注册），继续...", "WARN")
-        r = run("registration", "new")
-        if r.returncode != 0:
-            raise RuntimeError("registration new 失败")
-        time.sleep(3)
-        r = run("connect")
-        if r.returncode != 0:
-            raise RuntimeError("connect 失败")
-        time.sleep(10)
-        new_ip = requests.get("https://api.ipify.org", timeout=10).text
-        log(f"WARP 重连成功，新 IP: {new_ip}")
-        return True
-    except Exception as e:
-        log(f"WARP 重连失败: {e}，尝试直接 connect 兜底", "ERROR")
+    old_ip = get_exit_ip()
+    log(f"当前 IP: {old_ip}")
+    new_ip = old_ip
+    for attempt in range(1, max_tries + 1):
         try:
-            subprocess.run(["sudo", "warp-cli", "--accept-tos", "connect"], timeout=30, capture_output=True)
-            time.sleep(8)
-            requests.get("https://api.ipify.org", timeout=10)
-            log("WARP 兜底连接成功（IP 可能未更换）", "WARN")
-        except Exception as e2:
-            log(f"WARP 兜底连接也失败，后续请求可能无网络: {e2}", "ERROR")
+            _warp("disconnect")
+            time.sleep(3)
+            if _warp("registration", "delete").returncode != 0:
+                log("删除注册失败（可能未注册），继续...", "WARN")
+            if _warp("registration", "new").returncode != 0:
+                raise RuntimeError("registration new 失败")
+            time.sleep(3)
+            if _warp("connect").returncode != 0:
+                raise RuntimeError("connect 失败")
+            time.sleep(10)
+            new_ip = get_exit_ip()
+            if new_ip != "未知" and new_ip != old_ip:
+                log(f"✅ WARP 已更换 IP: {old_ip} → {new_ip}（第 {attempt} 次）")
+                return True
+            log(f"第 {attempt}/{max_tries} 次重注册后 IP 未变化（{new_ip}），重试...", "WARN")
+        except Exception as e:
+            log(f"第 {attempt}/{max_tries} 次 WARP 重连失败: {e}", "ERROR")
+            try:
+                _warp("connect")
+                time.sleep(8)
+            except Exception:
+                pass
+    if get_exit_ip() == "未知":
+        log("WARP 兜底后仍无网络，后续请求可能失败", "ERROR")
         return False
+    log(f"⚠️ 多次重注册 IP 仍为 {new_ip}（WARP 出口 IP 池共享，同机房常见），继续执行", "WARN")
+    return False
 
 
 def ensure_connected(sb):
@@ -343,7 +347,83 @@ return {cands: out, header: m ? m[1] : ''};
 """
 
 
-def scrape_uptime_seconds(sb, identifier: str, console_url: str) -> Optional[float]:
+def _uptime_from_obj(obj: dict) -> Optional[float]:
+    """从接口返回里找运行时长：uptime 类字段（秒/毫秒/文本）或启动时间戳。"""
+    for key, val in _flatten(obj):
+        k = key.lower()
+        if val in (None, "", 0):
+            continue
+        if "uptime" in k:
+            if isinstance(val, (int, float)) or (isinstance(val, str) and re.fullmatch(r"\d+(\.\d+)?", val)):
+                v = float(val)
+                # 带 ms 后缀，或数值超过 400 天秒数 → 视为毫秒（Pterodactyl resources.uptime 即毫秒）
+                if k.endswith("ms") or "milli" in k or v > 400 * 86400:
+                    v /= 1000.0
+                if 0 < v <= 400 * 86400:
+                    return v
+            elif isinstance(val, str):
+                sec = parse_duration_text(val)
+                if sec is not None:
+                    return sec
+        if any(t in k for t in ("started_at", "startedat", "start_time", "starttime", "last_start")):
+            try:
+                ts = float(val) if not isinstance(val, str) or val.replace(".", "", 1).isdigit() else \
+                    datetime.fromisoformat(val.replace("Z", "+00:00")).timestamp()
+                if ts > 1e12:
+                    ts /= 1000.0
+                diff = time.time() - ts
+                if 0 < diff <= 400 * 86400:
+                    return diff
+            except Exception:
+                continue
+    return None
+
+
+UPTIME_API_CANDIDATES = (
+    "/client/api/servers/{id}/resources",
+    "/client/api/server/{id}/resources",
+    "/client/api/servers/{id}/stats",
+)
+
+
+def api_uptime_seconds(sb, identifier: str) -> Optional[float]:
+    """优先用接口拿运行时长：先看状态接口，再试几个常见的 resources 接口。"""
+    sec = _uptime_from_obj(get_server_info(sb, identifier))
+    if sec is not None:
+        log("运行时长来源: 状态接口")
+        return sec
+    for tpl in UPTIME_API_CANDIDATES:
+        path = tpl.format(id=identifier)
+        st, data, _ = browser_fetch(sb, "GET", path, timeout=15)
+        if st == 200 and data:
+            sec = _uptime_from_obj(data)
+            if sec is not None:
+                log(f"运行时长来源: {path}")
+                return sec
+            log(f"{path} 返回字段中无运行时长: {sorted(k for k, _ in _flatten(data))[:30]}")
+    return None
+
+
+def get_uptime_seconds(sb, identifier: str, console_url: str) -> Optional[float]:
+    """接口优先，拿不到再读页面（页面需等控制台连上服务器才显示，读不到会刷新重试一次）。"""
+    sec = api_uptime_seconds(sb, identifier)
+    if sec is not None:
+        return sec
+    sec = scrape_uptime_seconds(sb, identifier, console_url, rounds=20)
+    if sec is not None:
+        return sec
+    log("页面首次未读到运行时长，刷新控制台后重试...")
+    try:
+        ensure_connected(sb)
+        sb.get(console_url)
+        time.sleep(5)
+        block_ads_modals(sb)
+    except Exception as e:
+        log(f"刷新控制台失败: {e}", "WARN")
+    return scrape_uptime_seconds(sb, identifier, console_url, rounds=20)
+
+
+def scrape_uptime_seconds(sb, identifier: str, console_url: str, rounds: int = 14) -> Optional[float]:
     """从控制台页面读取运行时长：优先 Server info 的 Uptime，其次顶部 'Online • 时长'。"""
     last = {}
     try:
@@ -351,7 +431,7 @@ def scrape_uptime_seconds(sb, identifier: str, console_url: str) -> Optional[flo
         if f"/servers/{identifier}/console" not in safe_url(sb):
             sb.get(console_url)
             time.sleep(3)
-        for _ in range(14):
+        for _ in range(rounds):
             last = sb.execute_script(SCRAPE_UPTIME_JS) or {}
             for cand in last.get("cands", []):
                 for line in cand.splitlines():
@@ -823,7 +903,7 @@ def login(sb, email: str, password: str) -> bool:
                 log(f"未找到登录表单（第 {attempt} 次）", "WARN")
 
         if attempt < max_attempts:
-            restart_warp()
+            restart_warp(max_tries=1)
             time.sleep(4)
 
     if not form_ok:
@@ -1039,7 +1119,7 @@ def process_account(idx: int, email: str, password: str) -> dict:
                     rec["ok"] = rec["ok"] and success
                     up = None
                     if is_server_running(final_status):
-                        up = scrape_uptime_seconds(sb, server_id,
+                        up = get_uptime_seconds(sb, server_id,
                                                    CONSOLE_URL_TEMPLATE.format(identifier=server_id))
                     if up is not None:
                         uptime_text = fmt_duration(up)
