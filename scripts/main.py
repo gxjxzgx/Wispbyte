@@ -1195,7 +1195,7 @@ def build_report(records: List[dict], elapsed: float, mask: bool = False, html: 
         lines += [
             "",
             "────────────",
-            f"{'✅' if r['ok'] else '❌'} {b(f'账号 {n}')}：{e(mask_email(r['email']))}",
+            f"{'✅' if r['ok'] else '❌'} {b('账号' + (chr(64 + n) if n <= 26 else str(n)))}：{c(mask_email(r['email']))}",
             f"🌐 出口 IP：{c(ipf(r['ip']))}{'（重复）' if dup else ''}",
         ]
         if r["error"]:
