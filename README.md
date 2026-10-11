@@ -31,6 +31,8 @@
 - `.github/workflows/main.yml` —— Actions 工作流定义
 
 > 内容较长，完整源码请从本仓库复制，或直接 Fork 本仓库。
+>
+> 提示：GitHub 会在仓库 60 天无提交后自动停用定时任务，届时到 Actions 页面重新启用即可。
 
 ### 2. 配置 Secrets
 
@@ -49,7 +51,7 @@
 
 - **手动运行**：Actions 页面 → `Wispbyte 自动重启` → Run workflow。
 - **API 触发**（见下方 API 调用方式）。
-- **定时运行**：取消 workflow 文件中 `schedule` 的注释，修改 cron 表达式。
+- **定时运行**：workflow 已默认开启每天 UTC 3:20（北京时间 11:20）运行，修改 `schedule` 里的 cron 表达式即可调整。
 
 ---
 
@@ -81,7 +83,7 @@ WISPBYTE_2 = alice@domain.com-----AnotherPass!
 
 ### 定时任务（Cron）
 
-编辑 `.github/workflows/wispbyte_restart.yml`，取消 `schedule` 注释：
+编辑 `.github/workflows/main.yml` 中的 `schedule`（默认已启用）：
 
 ```yaml
 on:
@@ -142,7 +144,7 @@ curl -X POST \
 1. 打开 Wispbyte 登录页，填写邮箱密码  
 2. 自动点击 Cloudflare Turnstile 验证  
 3. 登录成功后通过 API 获取所有服务器 ID  
-4. 进入每个服务器控制台，点击 **Start/Restart**  
+4. 进入每个服务器控制台：状态为 `running` 则跳过；离线/异常时先尝试直接调用 Start API，失败再点击 **Start**  
 5. 智能处理广告流程：  
    - 自动观看奖励视频（Watch ad to continue）  
    - 处理 “No ad available” 弹窗  
@@ -162,7 +164,9 @@ curl -X POST \
 ✅ 重启成功
 
 账号: a***@e***.com
-服务器: fb***73
+服务器: a1b2c3d4
+最终状态: 运行中
+运行时长: 2小时13分
 
 Wispbyte Auto Restart
 ```
@@ -214,7 +218,7 @@ Wispbyte Auto Restart
 ## 🚀 部署方式
 
 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)，进入 **Workers & Pages**  
-2. 创建一个新的 Worker，将 [`worker.js`](./worker.js) 代码粘贴进去  
+2. 创建一个新的 Worker，将 [`legacy/worker.js`](./legacy/worker.js) 代码粘贴进去  
 3. 创建 **KV 命名空间**（名称随意），在 Worker 设置中绑定，变量名为 `WISPBYTE_KV`  
 4. 配置环境变量（见下表）  
 5. 部署 Worker  
