@@ -13,6 +13,7 @@ Wispbyte 自动开机/重启脚本（优化版）
   - Turnstile 判定限定在验证弹窗内，避免残留 token 误判
   - 有资格但 Start API 失败、浏览器验证也未通过时不再空等轮询
   - 服务器 ID 兜底提取增加格式校验；WARP 重注册失败时尝试原样重连
+  - TG 推送合并为整次运行一条：汇总 + 每账号出口 IP + 每台服务器结果 + 截图相册
 """
 
 import os
@@ -25,7 +26,7 @@ import logging
 import tempfile
 import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Optional
 
 import requests
@@ -111,26 +112,6 @@ class Throttle:
 def log(msg: str, level: str = "INFO"):
     lv = {"INFO": logging.INFO, "WARN": logging.WARNING, "ERROR": logging.ERROR}.get(level, logging.INFO)
     logger.log(lv, f"[{level}] {msg}")
-
-
-def send_tg_photo(token: str, chat_id: str, photo_path: str, caption: str):
-    if not token or not chat_id:
-        return
-    if not photo_path or not os.path.exists(photo_path):
-        log(f"截图文件不存在: {photo_path}", "WARN")
-        return
-    try:
-        with open(photo_path, "rb") as f:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{token}/sendPhoto",
-                data={"chat_id": chat_id, "caption": caption},
-                files={"photo": f},
-                timeout=30,
-            )
-        resp.raise_for_status()
-        log("Telegram 图片通知发送成功")
-    except Exception as e:
-        log(f"Telegram 通知异常: {e}", "ERROR")
 
 
 def restart_warp() -> bool:
@@ -1016,32 +997,46 @@ def build_sb(user_data_dir: str):
     return SB(**kwargs)
 
 
-def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat: str) -> bool:
+def get_exit_ip() -> str:
+    """获取当前出口 IP（多个服务兜底）。"""
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://ipinfo.io/ip"):
+        try:
+            ip = requests.get(url, timeout=8).text.strip()
+            if ip and len(ip) <= 45:
+                return ip
+        except Exception:
+            continue
+    return "未知"
+
+
+def process_account(idx: int, email: str, password: str) -> dict:
+    """处理单个账号，返回结果记录（不再单独推送 TG，由 main 汇总后统一发送）。"""
     log("=" * 50)
     log(f"开始处理账号 {idx} | {mask_email(email)}")
     log("=" * 50)
 
-    all_ok = True
+    rec = {"email": email, "ip": "未知", "ok": True, "error": "", "servers": [], "shots": []}
     user_data_dir = tempfile.mkdtemp(prefix=f"wisp_usr_{idx}_")
     try:
         with build_sb(user_data_dir) as sb:
             try:
-                if not login(sb, email, password):
-                    shot = take_screenshot(sb, idx, "login-fail")
-                    send_tg_photo(tg_token, tg_chat, shot,
-                                  f"❌ 登录失败\n账号: {mask_email(email)}\n\nWispbyte Auto Restart")
-                    return False
+                logged_in = login(sb, email, password)
+                rec["ip"] = get_exit_ip()  # 登录重试可能切换过 WARP，登录后再取
+                log(f"出口 IP: {rec['ip']}")
+                if not logged_in:
+                    rec.update(ok=False, error="登录失败")
+                    rec["shots"].append(take_screenshot(sb, idx, "login-fail"))
+                    return rec
 
                 servers = get_servers(sb)
                 if not servers:
-                    shot = take_screenshot(sb, idx, "no-server")
-                    send_tg_photo(tg_token, tg_chat, shot,
-                                  f"❌ 未找到服务器\n账号: {mask_email(email)}\n\nWispbyte Auto Restart")
-                    return False
+                    rec.update(ok=False, error="未找到服务器")
+                    rec["shots"].append(take_screenshot(sb, idx, "no-server"))
+                    return rec
 
                 for si, server_id in enumerate(servers, start=1):
                     success, final_status, action_desc = restart_server(sb, server_id)
-                    all_ok = all_ok and success
+                    rec["ok"] = rec["ok"] and success
                     up = None
                     if is_server_running(final_status):
                         up = scrape_uptime_seconds(sb, server_id,
@@ -1053,24 +1048,109 @@ def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat:
                     else:
                         uptime_text = "未运行"
                     shot = take_screenshot(sb, idx, f"done-{si}" if len(servers) > 1 else "done")
-                    caption = (
-                        f"{'✅' if success else '❌'} {action_desc}\n\n"
-                        f"账号: {mask_email(email)}\n"
-                        f"服务器: {server_id}\n"
-                        f"最终状态: {status_to_chinese(final_status)}\n"
-                        f"运行时长: {uptime_text}\n\n"
-                        f"Wispbyte Auto Restart"
-                    )
-                    send_tg_photo(tg_token, tg_chat, shot, caption)
+                    rec["servers"].append({
+                        "id": server_id, "ok": success, "action": action_desc,
+                        "status": status_to_chinese(final_status), "uptime": uptime_text, "shot": shot,
+                    })
             except Exception as e:
                 log(f"账号 {idx} 处理异常: {e}", "ERROR")
-                shot = take_screenshot(sb, idx, "exception")
-                send_tg_photo(tg_token, tg_chat, shot,
-                              f"❌ 脚本异常\n账号: {mask_email(email)}\n信息: {str(e)[:200]}\n\nWispbyte Auto Restart")
-                return False
+                rec.update(ok=False, error=f"脚本异常: {str(e)[:150]}")
+                rec["shots"].append(take_screenshot(sb, idx, "exception"))
+                return rec
     finally:
         shutil.rmtree(user_data_dir, ignore_errors=True)
-    return all_ok
+    return rec
+
+
+# ====================== Telegram 汇总推送 ======================
+TG_CAPTION_LIMIT = 1024
+TG_TEXT_LIMIT = 4096
+TG_MEDIA_MAX = 10
+
+
+def build_report(records: List[dict], elapsed: float, mask: bool = False) -> str:
+    """mask=True 时打码服务器 ID 和 IP（用于公开的 Actions 日志）。"""
+    sid = mask_server_id if mask else (lambda x: x)
+    def ipf(ip: str) -> str:
+        if not mask:
+            return ip
+        if ":" in ip:  # IPv6 只保留前两段
+            return ":".join(ip.split(":")[:2]) + ":*"
+        return re.sub(r"\.\d+\.\d+$", ".*.*", ip)
+    servers = [s for r in records for s in r["servers"]]
+    skipped = sum(1 for s in servers if s["ok"] and s["action"].startswith("跳过"))
+    started = sum(1 for s in servers if s["ok"] and not s["action"].startswith("跳过"))
+    srv_failed = sum(1 for s in servers if not s["ok"])
+    acc_failed = sum(1 for r in records if not r["ok"])
+    lines = [
+        f"{'✅' if acc_failed == 0 else '⚠️'} Wispbyte 运行汇总",
+        f"时间: {datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')}（北京时间）",
+        f"耗时: {fmt_duration(elapsed)}",
+        f"账号: {len(records)} 个，失败 {acc_failed}",
+        f"服务器: {len(servers)} 台｜开机 {started}｜跳过 {skipped}｜失败 {srv_failed}",
+    ]
+    for r in records:
+        lines.append("")
+        lines.append(f"{'✅' if r['ok'] else '❌'} {mask_email(r['email'])}")
+        lines.append(f"🌐 出口IP: {ipf(r['ip'])}")
+        if r["error"]:
+            lines.append(f"   {r['error']}")
+        for s in r["servers"]:
+            lines.append(f"   {'✅' if s['ok'] else '❌'} {sid(s['id'])}｜{s['action']}｜{s['status']}｜{s['uptime']}")
+    lines += ["", "Wispbyte Auto Restart"]
+    return "\n".join(lines)
+
+
+def _tg_post(token: str, method: str, **kwargs) -> bool:
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{token}/{method}", timeout=60, **kwargs)
+        if not resp.ok:
+            log(f"Telegram {method} 失败: {resp.status_code} {resp.text[:200]}", "ERROR")
+            return False
+        return True
+    except Exception as e:
+        log(f"Telegram {method} 异常: {e}", "ERROR")
+        return False
+
+
+def send_tg_report(token: str, chat_id: str, records: List[dict], elapsed: float):
+    """整次运行只发一条：截图相册 + 汇总文字作为说明；文字超过 1024 字时改为纯文字消息。"""
+    if not token or not chat_id:
+        return
+    text = build_report(records, elapsed)
+    # 失败截图优先，最多 10 张
+    fail_shots = [x for r in records if not r["ok"] for x in r["shots"]] + \
+                 [s["shot"] for r in records for s in r["servers"] if not s["ok"]]
+    ok_shots = [s["shot"] for r in records for s in r["servers"] if s["ok"]]
+    shots = [p for p in dict.fromkeys(fail_shots + ok_shots) if p and os.path.exists(p)][:TG_MEDIA_MAX]
+
+    if shots and len(text) <= TG_CAPTION_LIMIT:
+        files, media = {}, []
+        for n, path in enumerate(shots):
+            key = f"p{n}"
+            files[key] = open(path, "rb")
+            item = {"type": "photo", "media": f"attach://{key}"}
+            if n == 0:
+                item["caption"] = text
+            media.append(item)
+        try:
+            if len(media) == 1:
+                ok = _tg_post(token, "sendPhoto", data={"chat_id": chat_id, "caption": text},
+                              files={"photo": files["p0"]})
+            else:
+                ok = _tg_post(token, "sendMediaGroup",
+                              data={"chat_id": chat_id, "media": json.dumps(media, ensure_ascii=False)},
+                              files=files)
+        finally:
+            for f in files.values():
+                f.close()
+        if ok:
+            log("Telegram 汇总通知发送成功（含截图）")
+            return
+    ok = _tg_post(token, "sendMessage", data={"chat_id": chat_id, "text": text[:TG_TEXT_LIMIT],
+                                              "disable_web_page_preview": True})
+    if ok:
+        log("Telegram 汇总通知发送成功（纯文字）")
 
 
 # ====================== 账号加载 ======================
@@ -1137,23 +1217,27 @@ def main():
         selected = indexed
         log("未指定账号，运行全部账号")
 
-    failed = 0
+    run_start = time.time()
+    records: List[dict] = []
     for order, (idx, email, password) in enumerate(selected):
         if order > 0:
             restart_warp()
         try:
-            ok = process_account(idx, email, password, tg_token, tg_chat)
+            rec = process_account(idx, email, password)
         except Exception as e:  # SB 启动失败等，不影响后续账号
             log(f"账号 {idx} 致命异常: {e}", "ERROR")
-            ok = False
-        if not ok:
-            failed += 1
+            rec = {"email": email, "ip": get_exit_ip(), "ok": False,
+                   "error": f"致命异常: {str(e)[:150]}", "servers": [], "shots": []}
+        records.append(rec)
         if order < len(selected) - 1:
             time.sleep(5)
 
-    log(f"所有账号处理完毕，失败 {failed}/{len(selected)}")
+    failed = sum(1 for r in records if not r["ok"])
+    log(f"所有账号处理完毕，失败 {failed}/{len(records)}")
+    report = build_report(records, time.time() - run_start, mask=True)
+    log("运行汇总:\n" + report)
+    send_tg_report(tg_token, tg_chat, records, time.time() - run_start)
     sys.exit(1 if failed else 0)
-
 
 if __name__ == "__main__":
     main()
