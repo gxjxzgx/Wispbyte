@@ -69,6 +69,14 @@ jobs:
 #          retention-days: 7
 #          if-no-files-found: ignore
 
+      - name: 保活（重新启用 workflow，防止 60 天无活动被停用）
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/main.yml/enable" \
+            && echo "✅ 保活成功" || echo "⚠️ 保活调用失败（不影响本次结果）"
+
       - name: 清理历史运行记录
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
