@@ -1188,12 +1188,15 @@ def build_report(records: List[dict], elapsed: float, mask: bool = False, html: 
         f"👤 账号：{len(records)} 个，成功 {len(records) - acc_failed}，失败 {acc_failed}",
         f"🖥 服务器：{len(servers)} 台，开机 {started}，跳过 {skipped}，失败 {srv_failed}",
     ]
+    seen_ips: set = set()
     for n, r in enumerate(records, start=1):
+        dup = r["ip"] != "未知" and r["ip"] in seen_ips
+        seen_ips.add(r["ip"])
         lines += [
             "",
             "────────────",
             f"{'✅' if r['ok'] else '❌'} {b(f'账号 {n}')}：{e(mask_email(r['email']))}",
-            f"🌐 出口 IP：{c(ipf(r['ip']))}",
+            f"🌐 出口 IP：{c(ipf(r['ip']))}{'（重复）' if dup else ''}",
         ]
         if r["error"]:
             lines.append(f"⚠️ {e(r['error'])}")
