@@ -119,11 +119,15 @@ def _warp(*args, timeout: int = 30):
     return subprocess.run(["sudo", "warp-cli", "--accept-tos", *args], timeout=timeout, capture_output=True)
 
 
+USED_IPS: set = set()  # 本次运行中已被账号用过的出口 IP
+
+
 def restart_warp(max_tries: int = 3) -> bool:
-    """重新注册 WARP 以更换出口 IP；新 IP 与旧 IP 相同则重试，最多 max_tries 次。"""
+    """重新注册 WARP 以更换出口 IP；新 IP 与当前 IP 或已用过的 IP 重复则重试，最多 max_tries 次。"""
     log("正在重启 WARP 以更换 IP...")
     old_ip = get_exit_ip()
-    log(f"当前 IP: {old_ip}")
+    log(f"当前 IP: {old_ip}，本次已用 IP: {sorted(USED_IPS)}")
+    avoid = USED_IPS | {old_ip}
     new_ip = old_ip
     for attempt in range(1, max_tries + 1):
         try:
@@ -138,10 +142,10 @@ def restart_warp(max_tries: int = 3) -> bool:
                 raise RuntimeError("connect 失败")
             time.sleep(10)
             new_ip = get_exit_ip()
-            if new_ip != "未知" and new_ip != old_ip:
+            if new_ip != "未知" and new_ip not in avoid:
                 log(f"✅ WARP 已更换 IP: {old_ip} → {new_ip}（第 {attempt} 次）")
                 return True
-            log(f"第 {attempt}/{max_tries} 次重注册后 IP 未变化（{new_ip}），重试...", "WARN")
+            log(f"第 {attempt}/{max_tries} 次重注册后 IP 重复（{new_ip}），重试...", "WARN")
         except Exception as e:
             log(f"第 {attempt}/{max_tries} 次 WARP 重连失败: {e}", "ERROR")
             try:
@@ -152,7 +156,7 @@ def restart_warp(max_tries: int = 3) -> bool:
     if get_exit_ip() == "未知":
         log("WARP 兜底后仍无网络，后续请求可能失败", "ERROR")
         return False
-    log(f"⚠️ 多次重注册 IP 仍为 {new_ip}（WARP 出口 IP 池共享，同机房常见），继续执行", "WARN")
+    log(f"⚠️ {max_tries} 次重注册后 IP 仍重复（{new_ip}）（WARP 出口 IP 池共享，同机房常见），继续执行", "WARN")
     return False
 
 
@@ -1329,13 +1333,15 @@ def main():
     records: List[dict] = []
     for order, (idx, email, password) in enumerate(selected):
         if order > 0:
-            restart_warp()
+            restart_warp(max_tries=6)
         try:
             rec = process_account(idx, email, password)
         except Exception as e:  # SB 启动失败等，不影响后续账号
             log(f"账号 {idx} 致命异常: {e}", "ERROR")
             rec = {"email": email, "ip": get_exit_ip(), "ok": False,
                    "error": f"致命异常: {str(e)[:150]}", "servers": [], "shots": []}
+        if rec.get("ip") and rec["ip"] != "未知":
+            USED_IPS.add(rec["ip"])
         records.append(rec)
         if order < len(selected) - 1:
             time.sleep(5)
