@@ -1,6 +1,6 @@
 # Wispbyte 多账号自动重启工具
 
-> 基于 **GitHub Actions + SeleniumBase** 的全自动服务器重启方案，支持自动登录、广告观看、Cloudflare Turnstile 验证，通过 **Telegram** 发送实时截图通知。
+> 基于 **GitHub Actions + SeleniumBase** 的全自动服务器重启方案，支持自动登录、广告观看、Cloudflare Turnstile 验证，通过 **Telegram** 推送运行汇总（含出口 IP 与截图）。
 
 ⚠️ **旧版 Cloudflare Workers 方案已失效**（Workers 平台无法处理 Turnstile 验证与浏览器指纹检测），本文档合并保留其 API 调用说明，**主体内容为 GitHub Actions 新方案**。  
 已部署 Workers 的用户请迁移至 Actions 版本。
@@ -15,7 +15,7 @@
 | Turnstile 验证 | ✅ 自动识别点击 | ❌ 不支持 |
 | 广告观看 | ✅ 自动处理 | ❌ 不支持 |
 | 每日自动执行 | ✅ Cron 定时 / API / 手动 | ✅ Cron 触发 |
-| Telegram 通知 | ✅ 每次重启截图通知 | ✅ 汇总报告 |
+| Telegram 通知 | ✅ 每次运行一条汇总（含截图、出口 IP） | ✅ 汇总报告 |
 | 部署难度 | 低（Fork + Secrets） | 中（Worker + KV） |
 | 当前状态 | ✅ 有效 | ❌ 已失效 |
 
@@ -79,7 +79,7 @@ WISPBYTE_2 = alice@domain.com-----AnotherPass!
 1. 向 [BotFather](https://t.me/botfather) 申请 Bot Token。
 2. 获取你的 Chat ID（向 bot 发消息后访问 `https://api.telegram.org/bot<TOKEN>/getUpdates`）。
 3. 填入 `TG_BOT_TOKEN` 和 `TG_CHAT_ID`。
-4. 重启完成后，Bot 将发送带截图的结果通知。
+4. 运行结束后，Bot 会推送一条汇总通知（含截图和出口 IP）。
 
 ### 定时任务（Cron）
 
@@ -151,27 +151,35 @@ curl -X POST \
    - 绕过 AdBlocker 检测页  
 6. 处理重启时弹出的 **CF Turnstile 二次验证弹窗**  
 7. 轮询服务器状态直至 `running`  
-8. 截图并通过 Telegram 发送结果  
+8. 截图并记录每个账号的出口 IP，全部完成后通过 Telegram 推送一条汇总  
 9. 多账号间自动切换 WARP IP（避免风控）
 
 ---
 
 ## 💬 Telegram 通知示例
 
-配置 Telegram 后，每台服务器重启结束会收到：
+配置 Telegram 后，**每次运行结束只推送一条消息**：所有截图合并为一个相册（失败截图优先，最多 10 张），汇总文字作为说明；文字超过 1024 字时改为纯文字消息。
 
 ```
-✅ 重启成功
+✅ Wispbyte 运行汇总
+时间: 2026-10-12 11:20（北京时间）
+耗时: 5分38秒
+账号: 2 个，失败 0
+服务器: 3 台｜开机 1｜跳过 2｜失败 0
 
-账号: a***@e***.com
-服务器: a1b2c3d4
-最终状态: 运行中
-运行时长: 2小时13分
+✅ a***e@gmail.com
+🌐 出口IP: 104.28.1.2
+   ✅ a1b2c3d4｜跳过（状态正常）｜运行中｜2小时13分
+   ✅ deadbeef｜开机成功｜运行中｜35秒
+
+✅ b***b@test.com
+🌐 出口IP: 104.28.9.8
+   ✅ 1234abcd｜跳过（状态正常）｜运行中｜1天3小时5分
 
 Wispbyte Auto Restart
 ```
 
-失败时同样会发送截图及错误描述。
+Actions 日志中也会打印同样的汇总，但服务器 ID 和 IP 会打码。
 
 ---
 
